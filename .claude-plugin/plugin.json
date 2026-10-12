@@ -1,0 +1,10 @@
+{
+  "name": "hrouter-canvas",
+  "version": "0.1.0",
+  "description": "Image generation with an infinite canvas for agents that cannot draw natively. Works with any OpenAI Images or Gemini compatible site you configure.",
+  "author": { "name": "HRouter", "url": "https://hrouter.net" },
+  "homepage": "https://github.com/honestTai/hrouter-canvas",
+  "repository": "https://github.com/honestTai/hrouter-canvas",
+  "license": "MIT",
+  "keywords": ["image-generation", "canvas", "mcp"]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "hrouter",
+  "description": "HRouter plugins for coding agents.",
+  "owner": {
+    "name": "HRouter",
+    "url": "https://hrouter.net"
+  },
+  "plugins": [
+    {
+      "name": "hrouter-canvas",
+      "source": "./",
+      "description": "Image generation with an infinite canvas for agents that cannot draw natively."
+    }
+  ]
+}
