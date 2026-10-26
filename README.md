@@ -2,11 +2,11 @@
 
 给编程 agent 用的生图、生视频插件：agent 不会画图时调用它，图片和视频保存成真实文件，同时出现在一块可以拖动、连线、继续创作的无限画布上。
 
-- **先出图，再让图动起来**：agent 先用一个模型生成图片，再把这张图交给另一个模型生成视频，全程由 agent 驱动。生图和生视频可以用不同的站点和 Key。
-
+- **先出图，再让图动起来**：agent 先在一个站点生成图片，再把这张图交给另一个站点生成视频，全程由 agent 驱动。生图站点和生视频站点分开配置，各用各的 Key。
+- **画布和 agent 共享内容**：你在画布上选中、截帧、调整；对 agent 说“把我选中的视频接着做”，它能找到那一项、看到视频关键帧，再自己继续生成。
 - **适配主流 agent**：Claude Code、Codex、opencode、DeepSeek Harness，以及任何支持 MCP 的客户端。
-- **站点和 Key 自己配**：生图支持任意兼容 OpenAI Images 或 Gemini 原生协议的站点；生视频默认用 HRouter，也支持其他兼容站点。可以配多个。
-- **本机运行**：画布、图片、配置都在你的电脑上，除了你配置的生图站点，不连任何服务器。
+- **站点和 Key 自己配**：生图支持任意兼容 OpenAI Images 或 Gemini 原生协议的站点；生视频默认用 HRouter，也支持兼容 OpenAI Videos 的站点。可以配多个。
+- **本机运行**：画布、图片、视频、配置都在你的电脑上，除了你配置的生图、生视频站点，不连任何服务器。
 - **自动更新**：agent 每次启动都拉取最新版。
 
 ## 安装
@@ -73,7 +73,7 @@ Claude Code 插件已包含技能。其他 agent 可以把本仓库的 `skills/i
 
 ## 配置站点
 
-第一次让 agent 画图时，画布的设置页会自动打开。填三样东西：
+第一次让 agent 画图或生视频时，如果还没有可用的站点，画布的设置页会自动打开。每个站点填三样东西：
 
 1. **站点地址**：例如 `https://hrouter.net`，填根地址或以 `/v1` 结尾的地址都可以。
 2. **API Key**。
@@ -96,6 +96,7 @@ Claude Code 插件已包含技能。其他 agent 可以把本仓库的 `skills/i
 | `HROUTER_CANVAS_VIDEO_API_KEY` | 生视频站点的 Key，不填则同 `HROUTER_CANVAS_API_KEY` |
 | `HROUTER_CANVAS_VIDEO_PROTOCOL` | `auto`（默认）、`xai` 或 `openai` |
 | `HROUTER_CANVAS_OPEN` | 设为 `never` 则从不自动打开浏览器 |
+| `HROUTER_CANVAS_FFMPEG` | 读取视频关键帧用的 ffmpeg 路径，默认在 PATH 中查找；设为 `off` 则只用画布页面解码 |
 | `HROUTER_CANVAS_PORT` | 本机端口，默认 17861 |
 | `HROUTER_CANVAS_HOME` | 数据目录，默认 `~/.hrouter-canvas` |
 
@@ -124,6 +125,8 @@ Claude Code 插件已包含技能。其他 agent 可以把本仓库的 `skills/i
 - “打开画布”
 - “画一张雪山木屋的图，再让它动起来，镜头缓慢推进，8 秒”
 - “把刚才那张海报做成一段 5 秒的视频”
+- “把我在画布上选中的视频接着往下做，镜头拉远”
+- “取这个视频第 3 秒的画面，改成夜景，再做成视频”
 
 agent 可用的工具：
 
@@ -160,6 +163,7 @@ npx hrouter-canvas-mcp open
 - **Key 只在本机**：保存在 `~/.hrouter-canvas/config.json`，权限 0600。页面和 agent 都读不回 Key。
 - **agent 不能配置站点**：所有工具都不接受站点地址或 Key 参数，防止提示词注入把 Key 发到别处。
 - **只监听 127.0.0.1**：页面需要本机访问令牌，服务校验 Host 和 Origin，其他网站无法通过你的浏览器操作它。
+- **agent 看到的画布**：`list_canvas` 和 `view_canvas_item` 只读取本机画布上的内容。你在画布上的选中状态只保存在内存里；视频关键帧缓存在对应画布目录的 `cache/` 下，删除视频时一并删除。
 - **生成结果不丢**：请求发出后，即使关掉页面或取消 agent 调用，结果仍会保存到画布。失败不会自动重试；视频任务查询状态时遇到短暂网络错误会继续查询，但绝不重新提交。
 - **图片 URL 下载有限制**：站点返回图片 URL 时，只接受 https（或与站点同源）的地址，并校验确实是大小受限的 PNG、JPEG 或 WebP。
 - **视频只收 MP4**：下载的视频会校验文件结构，大小上限 256 MB。HRouter 从 `/content` 接口下载；其他站点返回的视频链接只接受 https（或与站点同源），下载时不带 Key。
@@ -167,7 +171,7 @@ npx hrouter-canvas-mcp open
 
 ## 自动更新
 
-所有安装方式都通过 `npx -y hrouter-canvas-mcp@latest` 启动，所以新版本发布后，下次启动 agent 就会用上；后台的画布服务发现版本变化会自动重启。想固定版本，把 `@latest` 换成具体版本号。
+所有安装方式都通过 `npx -y hrouter-canvas-mcp@latest` 启动，所以新版本发布后，下次启动 agent 就会用上；后台的画布服务发现版本变化会自动重启，已打开的画布页面也会自动刷新。想固定版本，把 `@latest` 换成具体版本号。
 
 Claude Code 的插件外壳（技能和命令）通过插件市场更新：在 `/plugin` 的市场设置里开启自动更新，或手动运行 `claude plugin update hrouter-canvas@hrouter`。
 
@@ -181,7 +185,7 @@ pnpm install
 pnpm check
 ```
 
-`pnpm check` 会做类型检查、构建并运行测试。测试使用本地假站点，不会访问真实服务、不产生费用、不打开浏览器。
+`pnpm check` 会做类型检查、构建并运行测试。测试使用本地假站点，不会访问真实服务、不产生费用、不打开浏览器。本机装了 ffmpeg 时会额外测试用 ffmpeg 读取视频帧，没装则跳过这一项。
 
 用本地构建接入 Claude Code：
 

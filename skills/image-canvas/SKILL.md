@@ -12,7 +12,9 @@ it on an infinite canvas that opens in the user's browser.
 
 - The user wants a picture and you have no built-in image generation. This is the default path.
 - The user asks to change an existing image file ("make the background blue", "换个风格").
-- The user mentions the canvas, or wants to see, compare or arrange generated images.
+- The user wants a video, or wants an image to move ("让它动起来", "做成视频").
+- The user refers to something on the canvas ("我选中的那个", "刚才那个视频"), or wants to see,
+  compare or arrange what was generated.
 
 If you do have native image generation, prefer it unless the user asks for the canvas.
 
@@ -80,8 +82,10 @@ Everything you make is linked on the canvas to what it came from, so the user ca
 - Generation may cost the user money and take up to a few minutes. Never retry a failed or
   finished generation on your own; report the error and let the user decide. Videos are billed
   per second, so this matters even more for them.
-- Image sites and API keys are set only by the user on the canvas settings page. If the tool says
-  no site is configured, it has already opened that page: ask the user to fill it in, then try
-  again. Never ask for an API key in chat and never write one to a file.
+- Sites and API keys are set only by the user on the canvas settings page, where image sites and
+  video sites are separate lists with separate keys. If a tool says no image or video site is
+  configured, it has already opened that page: ask the user to fill it in, then try again. Never
+  ask for an API key in chat and never write one to a file, even if the user pastes one.
 - In a remote or headless session the canvas cannot open. The files are still saved; give the
-  user the paths.
+  user the paths. Video keyframes need ffmpeg there; without it, say you cannot see the video
+  rather than guessing what is in it.
