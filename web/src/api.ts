@@ -8,16 +8,22 @@ export interface Site {
   hasKey: boolean;
   keyHint: string;
 }
+// Video sites are their own list, with their own keys, separate from image sites.
+export interface VideoSite extends Omit<Site, 'protocol'> {
+  protocol: 'auto' | 'xai' | 'openai';
+}
 export interface CanvasImage {
   id: string;
   file: string;
   mime: string;
   width: number;
   height: number;
+  duration?: number;
   x: number;
   y: number;
   displayWidth: number;
-  kind: 'generated' | 'import';
+  kind: 'generated' | 'import' | 'frame';
+  frame?: { of: string; at: string };
   source: 'agent' | 'canvas';
   prompt: string;
   model: string;
@@ -34,6 +40,12 @@ export interface Pending {
   prompt: string;
   model: string;
   startedAt: number;
+  kind?: 'image' | 'video';
+}
+export interface VideoJob {
+  id: string;
+  status: 'running' | 'done' | 'failed';
+  error?: string;
 }
 export interface Board {
   id: string;
@@ -47,6 +59,8 @@ export interface AppState {
   version: string;
   sites: Site[];
   defaultSite: string | null;
+  videoSites: VideoSite[];
+  defaultVideoSite: string | null;
   current: string;
   boards: Array<{ id: string; title: string; updatedAt: number; count: number }>;
 }
@@ -86,5 +100,6 @@ export async function authorize(): Promise<{ settings: boolean }> {
   return { settings };
 }
 
+export const isVideo = (image: CanvasImage) => image.mime.startsWith('video/');
 export const imageUrl = (boardId: string, imageId: string, download = false) =>
   `/api/boards/${boardId}/images/${imageId}${download ? '?download=1' : ''}`;

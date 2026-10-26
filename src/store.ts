@@ -9,19 +9,26 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { ensureHome, HttpError } from './config.ts';
-import { imageExtension, inspectImage, type ImageInfo } from './image.ts';
+import { imageExtension, inspectImage, type ImageInfo, type VideoInfo } from './image.ts';
 
 export interface Point {
   x: number;
   y: number;
 }
-export interface CanvasImage extends ImageInfo, Point {
+// Videos share the node model with images, so a clip hangs off the frame it was made from.
+export interface CanvasImage extends Point {
   id: string;
+  mime: ImageInfo['mime'] | VideoInfo['mime'];
+  width: number;
+  height: number;
+  duration?: number;
   file: string;
   bytes: number;
   sha256: string;
   displayWidth: number;
-  kind: 'generated' | 'import';
+  kind: 'generated' | 'import' | 'frame';
+  // For a still taken from a video: which video, and where in it ('first', 'last' or seconds).
+  frame?: { of: string; at: string };
   source: 'agent' | 'canvas';
   prompt: string;
   model: string;
@@ -125,6 +132,18 @@ export class Store {
     rmSync(this.dir(id), { recursive: true, force: true });
     this.boards.delete(id);
   }
+  // A cached 2×2 keyframe sheet, so the agent can look at a video it cannot play.
+  sheetPath(board: Board, image: CanvasImage) {
+    return join(this.dir(board.id), 'cache', `${image.id}-sheet.jpg`);
+  }
+  // Agents refer to items by id alone; look on the current board first, then on the rest.
+  find(id: string): { board: Board; image: CanvasImage } | undefined {
+    const current = this.current();
+    for (const board of [current, ...this.list().filter((b) => b.id !== current.id).map((b) => this.get(b.id))]) {
+      const image = board.images.find((i) => i.id === id);
+      if (image) return { board, image };
+    }
+  }
   imagePath(board: Board, image: CanvasImage) {
     return join(this.dir(board.id), 'images', image.file);
   }
@@ -134,7 +153,7 @@ export class Store {
     return { image, bytes: new Uint8Array(readFileSync(this.imagePath(board, image))) };
   }
 
-  private place(board: Board, info: ImageInfo, parents: CanvasImage[], at?: Point): Point {
+  private place(board: Board, info: { width: number; height: number }, parents: CanvasImage[], at?: Point): Point {
     const height = (DISPLAY_WIDTH * info.height) / info.width;
     const boxes = board.images.map((i) => ({
       x: i.x,
@@ -170,14 +189,14 @@ export class Store {
   add(
     board: Board,
     bytes: Uint8Array,
-    meta: Pick<CanvasImage, 'kind' | 'source' | 'prompt' | 'model' | 'site'>,
-    options: { parents?: string[]; at?: Point } = {},
+    meta: Pick<CanvasImage, 'kind' | 'source' | 'prompt' | 'model' | 'site' | 'frame'>,
+    options: { parents?: string[]; at?: Point; video?: VideoInfo } = {},
   ): CanvasImage {
-    const info = inspectImage(bytes);
+    const info = options.video || inspectImage(bytes);
     const sha256 = createHash('sha256').update(bytes).digest('hex');
     // Re-importing the same reference file reuses its node instead of piling up copies.
-    if (meta.kind === 'import') {
-      const same = board.images.find((i) => i.kind === 'import' && i.sha256 === sha256);
+    if (meta.kind === 'import' || meta.kind === 'frame') {
+      const same = board.images.find((i) => i.kind === meta.kind && i.sha256 === sha256);
       if (same) return same;
     }
     if (board.images.length >= MAX_IMAGES)
@@ -213,6 +232,7 @@ export class Store {
     board.images = board.images.filter((i) => i.id !== id);
     board.edges = board.edges.filter((e) => e.source !== id && e.target !== id);
     rmSync(this.imagePath(board, image), { force: true });
+    rmSync(this.sheetPath(board, image), { force: true });
     this.save(board);
   }
   // Layout edits from the page: every field is validated, unknown ids are ignored.

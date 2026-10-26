@@ -7,6 +7,7 @@ export const MAX_IMPORT_BYTES = 20 * 1024 * 1024;
 // Output-only bounds: 4K PNGs can be much larger than reference uploads.
 export const MAX_GENERATED_IMAGE_BYTES = 72 * 1024 * 1024;
 export const MAX_GENERATION_RESPONSE_BYTES = 100 * 1024 * 1024;
+export const MAX_GENERATED_VIDEO_BYTES = 256 * 1024 * 1024;
 
 // Header inspection: reject non-images and decompression bombs before anything is stored or shown.
 export function inspectImage(bytes: Uint8Array): ImageInfo {
@@ -67,7 +68,63 @@ export function inspectImage(bytes: Uint8Array): ImageInfo {
   return { mime, width, height };
 }
 export const imageExtension = (mime: string) =>
-  mime === 'image/jpeg' ? 'jpg' : mime === 'image/webp' ? 'webp' : 'png';
+  mime === 'video/mp4' ? 'mp4' : mime === 'image/jpeg' ? 'jpg' : mime === 'image/webp' ? 'webp' : 'png';
+
+export interface VideoInfo {
+  mime: 'video/mp4';
+  width: number;
+  height: number;
+  duration?: number;
+}
+// MP4/MOV are trees of [size][type] boxes. The frame size comes from the first visual track
+// header and the length from the movie header; `fallback` covers files that omit a track size.
+export function inspectVideo(
+  bytes: Uint8Array,
+  fallback: { width: number; height: number } = { width: 1280, height: 720 },
+): VideoInfo {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const type = (i: number) => String.fromCharCode(...bytes.subarray(i, i + 4));
+  const children = (start: number, end: number) => {
+    const found: Array<{ type: string; start: number; end: number }> = [];
+    for (let i = start; i + 8 <= end; ) {
+      let size = view.getUint32(i),
+        header = 8;
+      if (size === 1) {
+        if (i + 16 > end) break;
+        size = Number(view.getBigUint64(i + 8));
+        header = 16;
+      } else if (size === 0) size = end - i;
+      if (size < header || i + size > end) break;
+      found.push({ type: type(i + 4), start: i + header, end: i + size });
+      i += size;
+    }
+    return found;
+  };
+  const top = children(0, bytes.length);
+  if (top[0]?.type !== 'ftyp') throw new Error('不是有效的 MP4 视频');
+  const moov = top.find((box) => box.type === 'moov');
+  if (!moov) throw new Error('视频文件不完整');
+  let width = 0,
+    height = 0,
+    duration: number | undefined;
+  for (const box of children(moov.start, moov.end)) {
+    const v1 = bytes[box.start] === 1;
+    if (box.type === 'mvhd' && box.end - box.start >= (v1 ? 32 : 20)) {
+      const scale = view.getUint32(box.start + (v1 ? 20 : 12));
+      const length = v1 ? Number(view.getBigUint64(box.start + 24)) : view.getUint32(box.start + 16);
+      if (scale) duration = Math.round((length / scale) * 10) / 10;
+    }
+    if (box.type !== 'trak' || width) continue;
+    const tkhd = children(box.start, box.end).find((child) => child.type === 'tkhd');
+    const at = tkhd && tkhd.start + ((bytes[tkhd.start] === 1 ? 88 : 76));
+    if (tkhd && at && at + 8 <= tkhd.end) {
+      width = view.getUint32(at) >>> 16;
+      height = view.getUint32(at + 4) >>> 16;
+    }
+  }
+  if (!width || !height || width > 16384 || height > 16384) ({ width, height } = fallback);
+  return { mime: 'video/mp4', width, height, ...(duration ? { duration } : {}) };
+}
 
 export type AspectRatio = `${number}:${number}`;
 export function normalizeAspectRatio(value: unknown): AspectRatio | null {

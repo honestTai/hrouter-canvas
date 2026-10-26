@@ -33,7 +33,10 @@ export const protocolFor = (site: Site, model: string): 'openai' | 'gemini' =>
   site.protocol === 'auto' ? (/^gemini-/i.test(model) ? 'gemini' : 'openai') : site.protocol;
 
 // Google's own endpoint treats a Bearer value as an OAuth token; relays usually expect Bearer.
-function authHeaders(site: Site, protocol: 'openai' | 'gemini'): Headers {
+export function authHeaders(
+  site: Pick<Site, 'apiKey' | 'baseUrl'>,
+  protocol: 'openai' | 'gemini',
+): Headers {
   const headers = new Headers();
   if (protocol === 'gemini') headers.set('x-goog-api-key', site.apiKey);
   if (protocol === 'openai' || !/(^|\.)googleapis\.com$/.test(new URL(site.baseUrl).hostname))
@@ -41,13 +44,36 @@ function authHeaders(site: Site, protocol: 'openai' | 'gemini'): Headers {
   return headers;
 }
 
-async function limitedBody(response: Response, limit: number): Promise<Uint8Array> {
+// fetch resolves once headers arrive. Reading its body can still fail independently.
+function bodyReadError(error: unknown, stage: string, signal?: AbortSignal): HttpError {
+  if (signal?.aborted) return new HttpError(499, '已取消');
+  const failure = error as { name?: string; cause?: { code?: unknown } } | null;
+  const rawCode = failure?.cause?.code;
+  // Never expose arbitrary exception text: it may contain URLs, credentials or response data.
+  const code = typeof rawCode === 'string' && /^(?:UND_ERR_[A-Z_]+|E[A-Z_]+)$/.test(rawCode)
+    ? rawCode
+    : '';
+  const timedOut = failure?.name === 'TimeoutError' || /TIMEOUT|TIMEDOUT/.test(code);
+  return new HttpError(
+    502,
+    `${stage}${timedOut ? '超时' : '时连接中断或数据读取失败'}${code ? `（${code}）` : ''}；服务端可能已完成生成，但本机未收到完整结果，未自动重试`,
+  );
+}
+
+export async function limitedBody(
+  response: Response,
+  limit: number,
+  stage = '读取站点响应',
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
   const reader = response.body?.getReader();
   if (!reader) return new Uint8Array();
   const chunks: Uint8Array[] = [];
   let size = 0;
   for (;;) {
-    const { value, done } = await reader.read();
+    const { value, done } = await reader.read().catch((error: unknown) => {
+      throw bodyReadError(error, stage, signal);
+    });
     if (done) break;
     size += value.byteLength;
     if (size > limit) {
@@ -66,7 +92,7 @@ async function limitedBody(response: Response, limit: number): Promise<Uint8Arra
 }
 
 // The site is the user's own choice, so its error text is shown to help them fix configuration.
-async function upstreamError(response: Response): Promise<HttpError> {
+export async function upstreamError(response: Response): Promise<HttpError> {
   let detail = '';
   try {
     const text = new TextDecoder().decode(await limitedBody(response, 64 * 1024));
@@ -96,7 +122,7 @@ async function upstreamError(response: Response): Promise<HttpError> {
   );
 }
 
-async function request(url: string, init: RequestInit, signal: AbortSignal): Promise<Response> {
+export async function request(url: string, init: RequestInit, signal: AbortSignal): Promise<Response> {
   try {
     return await fetch(url, {
       ...init,
@@ -142,7 +168,7 @@ async function download(site: Site, value: string, signal: AbortSignal): Promise
     await response.body?.cancel().catch(() => {});
     throw new HttpError(502, `下载生成图片失败（HTTP ${response.status}）`);
   }
-  const bytes = await limitedBody(response, MAX_GENERATED_IMAGE_BYTES);
+  const bytes = await limitedBody(response, MAX_GENERATED_IMAGE_BYTES, '下载生成图片', signal);
   try {
     return { bytes, ...inspectImage(bytes) };
   } catch {
@@ -214,7 +240,7 @@ async function generateOpenAI(
     signal,
   );
   if (!response.ok) throw await upstreamError(response);
-  const first = (await json(response))?.data?.[0];
+  const first = (await json(response, '读取生图接口响应', signal))?.data?.[0];
   if (typeof first?.b64_json === 'string' && first.b64_json) return decode(first.b64_json);
   if (typeof first?.url === 'string') {
     const data = /^data:image\/(?:png|jpeg|webp);base64,(.+)$/s.exec(first.url);
@@ -260,7 +286,7 @@ async function generateGemini(
     signal,
   );
   if (!response.ok) throw await upstreamError(response);
-  const value = await json(response);
+  const value = await json(response, '读取生图接口响应', signal);
   let said = '';
   for (const candidate of value?.candidates || [])
     for (const part of candidate?.content?.parts || []) {
@@ -275,8 +301,8 @@ async function generateGemini(
   );
 }
 
-async function json(response: Response): Promise<any> {
-  const bytes = await limitedBody(response, MAX_GENERATION_RESPONSE_BYTES);
+export async function json(response: Response, stage = '读取站点响应', signal?: AbortSignal): Promise<any> {
+  const bytes = await limitedBody(response, MAX_GENERATION_RESPONSE_BYTES, stage, signal);
   try {
     return JSON.parse(new TextDecoder().decode(bytes));
   } catch {
@@ -296,11 +322,14 @@ export function generateImage(
 
 const imageLike =
   /image|dall-e|imagen|flux|seedream|seededit|kolors|wanx|cogview|midjourney|stable-diffusion|sdxl|hidream|recraft|ideogram|qwen-image|banana/i;
-// Lists what the site advertises; `suggested` is a name-based guess at which ids draw images.
+const videoLike =
+  /video|veo|sora|kling|hailuo|seedance|vidu|runway|luma|pika|cogvideo|i2v|t2v/i;
+// Lists what the site advertises; `suggested` and `video` are name-based guesses at which ids
+// draw images and which make videos.
 export async function listModels(
-  site: Site,
+  site: Pick<Site, 'apiKey' | 'baseUrl'> & { protocol: string },
   signal: AbortSignal,
-): Promise<{ all: string[]; suggested: string[] }> {
+): Promise<{ all: string[]; suggested: string[]; video: string[] }> {
   const gemini = site.protocol === 'gemini';
   const response = await request(
     gemini ? `${geminiRoot(site.baseUrl)}/models?pageSize=1000` : `${openaiRoot(site.baseUrl)}/models`,
@@ -325,5 +354,9 @@ export async function listModels(
         .filter((id) => /^[a-zA-Z0-9][a-zA-Z0-9._:/@-]{0,119}$/.test(id)),
     ),
   ].sort();
-  return { all, suggested: all.filter((id) => imageLike.test(id)) };
+  return {
+    all,
+    suggested: all.filter((id) => imageLike.test(id) && !videoLike.test(id)),
+    video: all.filter((id) => videoLike.test(id)),
+  };
 }

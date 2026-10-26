@@ -9,18 +9,28 @@ export const DEFAULT_PORT = 17861;
 export const home = () => process.env.HROUTER_CANVAS_HOME || join(homedir(), '.hrouter-canvas');
 
 export type Protocol = 'auto' | 'openai' | 'gemini';
-export interface Site {
+export type VideoProtocol = 'auto' | 'xai' | 'openai';
+interface Endpoint {
   id: string;
   name: string;
   baseUrl: string;
-  protocol: Protocol;
   apiKey: string;
   models: string[];
   defaultModel?: string;
 }
+export interface Site extends Endpoint {
+  protocol: Protocol;
+}
+export interface VideoSite extends Endpoint {
+  protocol: VideoProtocol;
+}
+// Image and video sites are separate lists with their own keys: a picture made on one site can
+// become a video on another, and a key that can draw is often not allowed to make videos.
 export interface Config {
   sites: Site[];
   defaultSite?: string;
+  videoSites: VideoSite[];
+  defaultVideoSite?: string;
 }
 export class HttpError extends Error {
   status: number;
@@ -38,6 +48,16 @@ const preset = (): Site => ({
   apiKey: '',
   models: ['gpt-image-2', 'gemini-3.1-flash-image'],
 });
+// HRouter makes videos only with a grok-group key, so its video preset is a site of its own.
+const videoPreset = (): VideoSite => ({
+  id: 'hrouter-video',
+  name: 'HRouter 视频',
+  baseUrl: 'https://hrouter.net',
+  protocol: 'auto',
+  apiKey: '',
+  models: ['grok-imagine-video-1.5', 'grok-imagine-video'],
+  defaultModel: 'grok-imagine-video-1.5',
+});
 
 export function ensureHome(): string {
   const dir = home();
@@ -53,24 +73,43 @@ export function writePrivate(path: string, content: string): void {
 }
 
 const configPath = () => join(home(), 'config.json');
+function parseList<T>(value: unknown, normalize: (item: unknown) => T): T[] {
+  const list: T[] = [];
+  for (const item of Array.isArray(value) ? value : []) {
+    try {
+      list.push(normalize(item));
+    } catch {
+      // A hand-edited invalid entry is skipped rather than breaking every other site.
+    }
+  }
+  return list;
+}
 export function loadConfig(): Config {
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(configPath(), 'utf8'));
   } catch {
-    return { sites: [preset()], defaultSite: 'hrouter' };
+    return {
+      sites: [preset()],
+      defaultSite: 'hrouter',
+      videoSites: [videoPreset()],
+      defaultVideoSite: 'hrouter-video',
+    };
   }
-  const raw = parsed as Partial<Config>;
-  const sites: Site[] = [];
-  for (const item of Array.isArray(raw.sites) ? raw.sites : []) {
-    try {
-      sites.push(normalizeSite(item));
-    } catch {
-      // A hand-edited invalid entry is skipped rather than breaking every other site.
-    }
-  }
-  const defaultSite = sites.some((s) => s.id === raw.defaultSite) ? raw.defaultSite : sites[0]?.id;
-  return { sites, defaultSite };
+  const raw = parsed as Record<string, unknown>;
+  const sites = parseList(raw.sites, (item) => normalizeSite(item));
+  // Configs written before video support start with the HRouter video preset.
+  const videoSites = Array.isArray(raw.videoSites)
+    ? parseList(raw.videoSites, (item) => normalizeVideoSite(item))
+    : [videoPreset()];
+  const pickDefault = (list: Endpoint[], wanted: unknown) =>
+    list.some((s) => s.id === wanted) ? (wanted as string) : list[0]?.id;
+  return {
+    sites,
+    defaultSite: pickDefault(sites, raw.defaultSite),
+    videoSites,
+    defaultVideoSite: pickDefault(videoSites, raw.defaultVideoSite),
+  };
 }
 export function saveConfig(config: Config): void {
   ensureHome();
@@ -104,15 +143,18 @@ export function normalizeBaseUrl(value: unknown): string {
 }
 
 const safeModel = /^[a-zA-Z0-9][a-zA-Z0-9._:/@-]{0,119}$/;
-export function normalizeSite(input: unknown, existingKey = ''): Site {
+function normalizeEndpoint<P extends string>(
+  input: unknown,
+  existingKey: string,
+  protocols: readonly P[],
+): Endpoint & { protocol: P } {
   const raw = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
   const id = typeof raw.id === 'string' ? raw.id : '';
   if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(id))
     throw new HttpError(400, '站点 ID 只能包含小写字母、数字和连字符');
   const name = typeof raw.name === 'string' ? raw.name.trim().slice(0, 40) : '';
-  const protocol = raw.protocol;
-  if (protocol !== 'auto' && protocol !== 'openai' && protocol !== 'gemini')
-    throw new HttpError(400, '协议类型无效');
+  const protocol = raw.protocol as P;
+  if (!protocols.includes(protocol)) throw new HttpError(400, '协议类型无效');
   const models = [
     ...new Set(
       (Array.isArray(raw.models) ? raw.models : []).filter(
@@ -137,48 +179,94 @@ export function normalizeSite(input: unknown, existingKey = ''): Site {
     ...(defaultModel ? { defaultModel } : {}),
   };
 }
-export const publicSite = ({ apiKey, ...site }: Site) => ({
+export const normalizeSite = (input: unknown, existingKey = ''): Site =>
+  normalizeEndpoint(input, existingKey, ['auto', 'openai', 'gemini'] as const);
+export const normalizeVideoSite = (input: unknown, existingKey = ''): VideoSite =>
+  normalizeEndpoint(input, existingKey, ['auto', 'xai', 'openai'] as const);
+export const publicSite = <T extends { apiKey: string }>({ apiKey, ...site }: T) => ({
   ...site,
   hasKey: !!apiKey,
   keyHint: apiKey.length >= 12 ? `…${apiKey.slice(-4)}` : '',
 });
 
-// Headless setups configure one site through the MCP server's environment instead of the page.
+// Headless setups configure sites through the MCP server's environment instead of the page. The
+// video site reuses the image site's address and key unless its own are given.
 export function applyEnvSite(env: NodeJS.ProcessEnv = process.env): void {
+  const config = loadConfig();
+  let next = config;
   const baseUrl = env.HROUTER_CANVAS_BASE_URL,
     apiKey = env.HROUTER_CANVAS_API_KEY;
-  if (!baseUrl || !apiKey) return;
-  const model = env.HROUTER_CANVAS_MODEL;
-  const site = normalizeSite({
-    id: 'env',
-    name: env.HROUTER_CANVAS_SITE_NAME || '环境变量站点',
-    baseUrl,
-    protocol: env.HROUTER_CANVAS_PROTOCOL || 'auto',
-    apiKey,
-    models: model ? [model] : [],
-    defaultModel: model,
-  });
-  const config = loadConfig();
-  const current = config.sites.find((s) => s.id === 'env');
-  if (current && JSON.stringify(current) === JSON.stringify(site) && config.defaultSite === 'env')
-    return;
-  saveConfig({ sites: [site, ...config.sites.filter((s) => s.id !== 'env')], defaultSite: 'env' });
+  if (baseUrl && apiKey) {
+    const model = env.HROUTER_CANVAS_MODEL;
+    const site = normalizeSite({
+      id: 'env',
+      name: env.HROUTER_CANVAS_SITE_NAME || '环境变量站点',
+      baseUrl,
+      protocol: env.HROUTER_CANVAS_PROTOCOL || 'auto',
+      apiKey,
+      models: model ? [model] : [],
+      defaultModel: model,
+    });
+    next = { ...next, sites: [site, ...next.sites.filter((s) => s.id !== 'env')], defaultSite: 'env' };
+  }
+  const videoModel = env.HROUTER_CANVAS_VIDEO_MODEL;
+  const videoUrl = env.HROUTER_CANVAS_VIDEO_BASE_URL || baseUrl,
+    videoKey = env.HROUTER_CANVAS_VIDEO_API_KEY || apiKey;
+  if (videoModel && videoUrl && videoKey) {
+    const site = normalizeVideoSite({
+      id: 'env',
+      name: env.HROUTER_CANVAS_VIDEO_SITE_NAME || '环境变量视频站点',
+      baseUrl: videoUrl,
+      protocol: env.HROUTER_CANVAS_VIDEO_PROTOCOL || 'auto',
+      apiKey: videoKey,
+      models: [videoModel],
+      defaultModel: videoModel,
+    });
+    next = {
+      ...next,
+      videoSites: [site, ...next.videoSites.filter((s) => s.id !== 'env')],
+      defaultVideoSite: 'env',
+    };
+  }
+  if (JSON.stringify(next) !== JSON.stringify(config)) saveConfig(next);
 }
 
-export function resolveSite(config: Config, wanted?: string): Site {
-  const usable = config.sites.filter((s) => s.apiKey);
+function pick<T extends Endpoint>(
+  list: T[],
+  fallback: string | undefined,
+  wanted: string | undefined,
+  kind: string,
+  setup: string,
+): T {
   if (wanted) {
-    const match = config.sites.find(
-      (s) => s.id === wanted || s.name.toLowerCase() === wanted.toLowerCase(),
-    );
-    if (!match) throw new HttpError(400, `没有名为 ${wanted} 的生图站点`);
+    const match = list.find((s) => s.id === wanted || s.name.toLowerCase() === wanted.toLowerCase());
+    if (!match) throw new HttpError(400, `没有名为 ${wanted} 的${kind}站点`);
     if (!match.apiKey) throw new HttpError(409, `站点 ${match.name} 还没有填写 API Key`);
     return match;
   }
-  const site = usable.find((s) => s.id === config.defaultSite) || usable[0];
-  if (!site) throw new HttpError(409, '还没有配置可用的生图站点，请先在画布设置中填写站点地址和 API Key');
+  const usable = list.filter((s) => s.apiKey);
+  const site = usable.find((s) => s.id === fallback) || usable[0];
+  if (!site) throw new HttpError(409, setup);
   return site;
 }
+export const resolveSite = (config: Config, wanted?: string): Site =>
+  pick(config.sites, config.defaultSite, wanted, '生图', '还没有配置可用的生图站点，请先在画布设置中填写站点地址和 API Key');
+export const resolveVideoSite = (config: Config, wanted?: string): VideoSite =>
+  pick(
+    config.videoSites,
+    config.defaultVideoSite,
+    wanted,
+    '生视频',
+    '还没有配置可用的生视频站点，请在画布设置的“生视频站点”中填写 API Key（HRouter 需要 grok 分组的 Key）',
+  );
+
+// No browser can be opened here: the user asked for none, or this is a remote or CI session.
+export const headless = (env: NodeJS.ProcessEnv = process.env) =>
+  env.HROUTER_CANVAS_OPEN === 'never' ||
+  !!env.SSH_CONNECTION ||
+  !!env.SSH_TTY ||
+  !!env.CI ||
+  (process.platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY);
 
 export function secret(): string {
   const path = join(ensureHome(), 'secret');

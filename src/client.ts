@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { openSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { DEFAULT_PORT, ensureHome, HttpError, secret, VERSION } from './config.ts';
+import { DEFAULT_PORT, ensureHome, headless, HttpError, secret, VERSION } from './config.ts';
 import { daemonFile, probe } from './daemon.ts';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -60,13 +60,6 @@ export async function ensureDaemon(): Promise<number> {
 
 export const canvasUrl = (port: number, withToken = false, hash = '') =>
   `http://127.0.0.1:${port}/${withToken ? `#t=${secret()}${hash ? `&${hash}` : ''}` : hash ? `#${hash}` : ''}`;
-
-export const headless = (env: NodeJS.ProcessEnv = process.env) =>
-  env.HROUTER_CANVAS_OPEN === 'never' ||
-  !!env.SSH_CONNECTION ||
-  !!env.SSH_TTY ||
-  !!env.CI ||
-  (process.platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY);
 
 export type OpenResult = 'opened' | 'already-open' | 'headless' | 'failed';
 // The token rides in the URL fragment: it is never sent to a server or written to logs, and the

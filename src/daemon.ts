@@ -1,25 +1,42 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import {
+  copyFileSync,
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { dirname, extname, isAbsolute, join, normalize, sep } from 'node:path';
+import { pipeline } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_PORT,
   ensureHome,
+  headless,
   home,
   HttpError,
   loadConfig,
   normalizeSite,
+  normalizeVideoSite,
   publicSite,
   resolveSite,
+  resolveVideoSite,
   saveConfig,
   secret,
   VERSION,
   writePrivate,
+  type Site,
+  type VideoSite,
 } from './config.ts';
-import { imageExtension, MAX_IMPORT_BYTES, normalizeAspectRatio } from './image.ts';
+import { ffmpegFrames, ffmpegPath, frameLabel, parseFrameAt, type FrameAt, type FrameRequest } from './frames.ts';
+import { imageExtension, inspectImage, MAX_IMPORT_BYTES, normalizeAspectRatio } from './image.ts';
 import { generateImage, listModels, protocolFor, type Reference } from './providers.ts';
 import { Store, type Board, type CanvasImage } from './store.ts';
+import { generateVideo, videoProtocolFor } from './video.ts';
 
 export interface Daemon {
   port: number;
@@ -33,7 +50,30 @@ interface Pending {
   prompt: string;
   model: string;
   startedAt: number;
+  kind: 'image' | 'video';
 }
+// Videos take minutes, so callers get a job id at once and poll it instead of holding a request.
+export interface VideoJob {
+  id: string;
+  status: 'running' | 'done' | 'failed';
+  board: { id: string; title: string };
+  prompt: string;
+  model: string;
+  site: string;
+  protocol: 'xai' | 'openai';
+  startedAt: number;
+  finishedAt?: number;
+  video?: {
+    id: string;
+    path: string;
+    savedTo?: string;
+    width: number;
+    height: number;
+    duration?: number;
+  };
+  error?: string;
+}
+const MAX_JOBS = 50;
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -47,6 +87,7 @@ const MIME: Record<string, string> = {
 const CSP =
   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 const safeModel = /^[a-zA-Z0-9][a-zA-Z0-9._:/@-]{0,119}$/;
+const isVideo = (item: CanvasImage) => item.mime.startsWith('video/');
 const same = (a: string, b: string) =>
   a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
 const slug = (prompt: string) =>
@@ -106,6 +147,7 @@ export async function startDaemon(
     join(dirname(fileURLToPath(import.meta.url)), 'web');
   const store = new Store();
   const pending = new Map<string, Pending>();
+  const jobs = new Map<string, VideoJob>();
   const viewers = new Set<ServerResponse>();
   const shutdown = new AbortController();
   let port = 0,
@@ -113,10 +155,16 @@ export async function startDaemon(
     lastActivity = Date.now(),
     pendingSeq = 0;
 
-  const emit = (boardId?: string) => {
-    const frame = `event: change\ndata: ${JSON.stringify({ boardId: boardId || null })}\n\n`;
+  const broadcast = (event: string, data: unknown) => {
+    const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
     for (const viewer of viewers) viewer.write(frame);
   };
+  const emit = (boardId?: string) => broadcast('change', { boardId: boardId || null });
+  // What the user has selected on each board, as last reported by an open page. Agents read it
+  // so "change the one I selected" works.
+  const selection = new Map<string, string[]>();
+  const frameRequests = new Map<string, (bytes: Uint8Array) => void>();
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
   const send = (response: ServerResponse, status: number, body: unknown, headers = {}) => {
     response.writeHead(status, {
       'Content-Type': 'application/json; charset=utf-8',
@@ -149,14 +197,21 @@ export async function startDaemon(
             error instanceof HttpError ? `参考图超过 20 MB：${item}` : `无法读取参考图：${item}`,
           );
         }
-        image = store.add(board, bytes, {
-          kind: 'import',
-          source: 'agent',
-          prompt: '',
-          model: '',
-          site: '',
-        });
+        try {
+          image = store.add(board, bytes, {
+            kind: 'import',
+            source: 'agent',
+            prompt: '',
+            model: '',
+            site: '',
+          });
+        } catch (error) {
+          if (error instanceof HttpError) throw error;
+          throw new HttpError(400, `参考图不是有效的 PNG、JPEG 或 WebP 图片：${item}`);
+        }
       }
+      if (isVideo(image))
+        throw new HttpError(400, '视频不能直接用作参考图：先用 extract_frame（画布上的“截取帧”）取出一帧，再用那张图');
       ids.push(image.id);
       refs.push({ bytes: store.read(board, image.id).bytes, mime: image.mime });
     }
@@ -165,7 +220,7 @@ export async function startDaemon(
 
   function exportCopy(board: Board, image: CanvasImage, saveTo: string, index: number): string {
     const extension = imageExtension(image.mime);
-    const named = /\.(png|jpe?g|webp)$/i.test(saveTo);
+    const named = /\.(png|jpe?g|webp|mp4)$/i.test(saveTo);
     let stem = named
       ? saveTo.replace(/\.[^.]+$/, '') + (index ? `-${index + 1}` : '')
       : join(saveTo, `${slug(image.prompt)}-${image.id.slice(0, 6)}`);
@@ -209,6 +264,7 @@ export async function startDaemon(
         prompt: prompt.slice(0, 200),
         model,
         startedAt: Date.now(),
+        kind: 'image' as const,
       };
       pending.set(mark.id, mark);
       return mark;
@@ -274,6 +330,209 @@ export async function startDaemon(
       images,
       errors: errors.map((e) => e.message),
     };
+  }
+
+  // Frames come from ffmpeg when it is installed; otherwise an open canvas page decodes them
+  // with the browser's own video player and posts the picture back.
+  async function capture(board: Board, video: CanvasImage, request: FrameRequest): Promise<Uint8Array> {
+    const bin = ffmpegPath();
+    if (bin)
+      try {
+        return await ffmpegFrames(bin, store.imagePath(board, video), video.duration, request);
+      } catch (error) {
+        console.error(new Date().toISOString(), 'ffmpeg frame capture failed', error);
+      }
+    // A page the agent just opened may still be loading; in a headless session none will come.
+    for (let i = 0; !viewers.size && !headless() && i < 30; i++) await sleep(500);
+    if (!viewers.size)
+      throw new HttpError(503, '读取视频画面需要本机安装 ffmpeg，或在浏览器中打开画布（npx hrouter-canvas-mcp open）');
+    const id = randomBytes(8).toString('hex');
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        frameRequests.delete(id);
+        reject(new HttpError(504, '画布页面没有在 30 秒内返回视频画面'));
+      }, 30_000);
+      frameRequests.set(id, (bytes) => {
+        clearTimeout(timer);
+        resolve(bytes);
+      });
+      broadcast('frames', {
+        id,
+        url: `/api/boards/${board.id}/images/${video.id}`,
+        ...(request.kind === 'sheet' ? { kind: 'sheet' } : { kind: 'frame', at: request.at }),
+      });
+    });
+  }
+  async function sheet(board: Board, video: CanvasImage): Promise<Uint8Array> {
+    const path = store.sheetPath(board, video);
+    if (existsSync(path)) return new Uint8Array(readFileSync(path));
+    const bytes = await capture(board, video, { kind: 'sheet' });
+    inspectImage(bytes);
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    writeFileSync(path, bytes);
+    return bytes;
+  }
+  // A still from a video becomes its own node, linked from the video, so it can be edited or
+  // animated like any other image.
+  async function frameNode(board: Board, video: CanvasImage, at: FrameAt, agent: boolean) {
+    const bytes = await capture(board, video, { kind: 'frame', at });
+    try {
+      inspectImage(bytes);
+    } catch {
+      throw new HttpError(502, '没能从视频中取出有效画面');
+    }
+    const item = store.add(
+      board,
+      bytes,
+      {
+        kind: 'frame',
+        source: agent ? 'agent' : 'canvas',
+        prompt: video.prompt,
+        model: '',
+        site: '',
+        frame: { of: video.id, at: String(at) },
+      },
+      { parents: [video.id] },
+    );
+    emit(board.id);
+    return item;
+  }
+
+  async function startVideo(body: Record<string, unknown>, agent: boolean): Promise<VideoJob> {
+    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+    if (!prompt || prompt.length > 8000) throw new HttpError(400, '提示词不能为空，且不超过 8000 字');
+    const duration =
+      body.duration === undefined || body.duration === '' ? undefined : Number(body.duration);
+    if (duration !== undefined && (!Number.isInteger(duration) || duration < 1 || duration > 60))
+      throw new HttpError(400, '视频时长应为 1 到 60 之间的整数秒');
+    const resolution =
+      typeof body.resolution === 'string' && body.resolution ? body.resolution.toLowerCase() : undefined;
+    if (body.resolution && !/^\d{3,4}p$/.test(resolution || ''))
+      throw new HttpError(400, '视频分辨率应类似 480p、720p');
+    const aspectRatio =
+      body.aspectRatio === undefined || body.aspectRatio === ''
+        ? undefined
+        : normalizeAspectRatio(body.aspectRatio);
+    if (aspectRatio === null) throw new HttpError(400, '画面比例无效，应类似 16:9');
+    const saveTo = agent && typeof body.saveTo === 'string' && body.saveTo ? body.saveTo : '';
+    if (saveTo && !isAbsolute(saveTo)) throw new HttpError(400, 'save_to 必须是绝对路径');
+    const site = resolveVideoSite(loadConfig(), typeof body.site === 'string' ? body.site : undefined);
+    const model =
+      (typeof body.model === 'string' && body.model) || site.defaultModel || site.models[0];
+    if (!model)
+      throw new HttpError(409, `站点 ${site.name} 还没有配置视频模型，请在画布设置中添加`);
+    if (!safeModel.test(model)) throw new HttpError(400, '模型名无效');
+    const board =
+      typeof body.boardId === 'string' && body.boardId ? store.get(body.boardId) : store.current();
+    // A video as the start continues it from its last frame.
+    let start = body.image;
+    const continued = typeof start === 'string' ? board.images.find((i) => i.id === start) : undefined;
+    if (continued && isVideo(continued)) start = (await frameNode(board, continued, 'last', agent)).id;
+    const { ids, refs } = references(board, start ? [start] : [], agent);
+    const first = ids[0] ? board.images.find((i) => i.id === ids[0]) : undefined;
+
+    const job: VideoJob = {
+      id: `v${randomBytes(6).toString('hex')}`,
+      status: 'running',
+      board: { id: board.id, title: board.title },
+      prompt,
+      model,
+      site: site.name,
+      protocol: videoProtocolFor(site, model),
+      startedAt: Date.now(),
+    };
+    jobs.set(job.id, job);
+    for (const old of jobs.values())
+      if (jobs.size > MAX_JOBS && old.status !== 'running') jobs.delete(old.id);
+    const mark: Pending = {
+      id: `p${++pendingSeq}`,
+      boardId: board.id,
+      prompt: prompt.slice(0, 200),
+      model,
+      startedAt: job.startedAt,
+      kind: 'video',
+    };
+    pending.set(mark.id, mark);
+    inFlight++;
+    emit(board.id);
+    // Like images, the job is not tied to whoever asked: a finished video always lands on the
+    // canvas, even if the agent's call timed out or the tab closed.
+    void generateVideo(
+      site,
+      {
+        model,
+        prompt,
+        duration,
+        resolution,
+        aspectRatio,
+        ...(first && refs[0] ? { image: { ...refs[0], width: first.width, height: first.height } } : {}),
+      },
+      shutdown.signal,
+    )
+      .then((video) => {
+        const { bytes, ...info } = video;
+        const item = store.add(
+          board,
+          bytes,
+          { kind: 'generated', source: agent ? 'agent' : 'canvas', prompt, model, site: site.name },
+          { parents: ids, video: info },
+        );
+        job.video = {
+          id: item.id,
+          path: store.imagePath(board, item),
+          ...(saveTo ? { savedTo: exportCopy(board, item, saveTo, 0) } : {}),
+          width: item.width,
+          height: item.height,
+          ...(item.duration ? { duration: item.duration } : {}),
+        };
+        job.status = 'done';
+      })
+      .catch((error) => {
+        job.status = 'failed';
+        job.error = error instanceof HttpError ? error.message : '视频生成失败，未自动重试';
+        if (!(error instanceof HttpError)) console.error(new Date().toISOString(), error);
+      })
+      .finally(() => {
+        job.finishedAt = Date.now();
+        pending.delete(mark.id);
+        inFlight--;
+        lastActivity = Date.now();
+        emit(board.id);
+      });
+    return job;
+  }
+
+  // Byte ranges let browsers seek in videos; Safari will not play a video without them.
+  function serveMedia(request: IncomingMessage, response: ServerResponse, board: Board, id: string, download: boolean) {
+    const item = board.images.find((i) => i.id === id);
+    if (!item) throw new HttpError(404, '图片不存在');
+    const file = store.imagePath(board, item);
+    const size = statSync(file).size;
+    let start = 0,
+      end = size - 1,
+      status = 200;
+    const range = /^bytes=(\d*)-(\d*)$/.exec(String(request.headers.range || ''));
+    if (range && (range[1] || range[2])) {
+      if (range[1]) {
+        start = Number(range[1]);
+        end = range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
+      } else start = Math.max(0, size - Number(range[2]));
+      if (start > end || start >= size) {
+        response.writeHead(416, { 'Content-Range': `bytes */${size}` });
+        return response.end();
+      }
+      status = 206;
+    }
+    response.writeHead(status, {
+      'Content-Type': item.mime,
+      'Content-Length': end - start + 1,
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'private, max-age=31536000, immutable',
+      ...(status === 206 ? { 'Content-Range': `bytes ${start}-${end}/${size}` } : {}),
+      ...(download ? { 'Content-Disposition': `attachment; filename="canvas-${item.file}"` } : {}),
+    });
+    // pipeline closes the file when a player drops a range request partway, which seeking does.
+    pipeline(createReadStream(file, { start, end }), response, () => {});
   }
 
   function serveStatic(pathname: string, response: ServerResponse) {
@@ -359,11 +618,100 @@ export async function startDaemon(
         version: VERSION,
         sites: config.sites.map(publicSite),
         defaultSite: config.defaultSite || null,
+        videoSites: config.videoSites.map(publicSite),
+        defaultVideoSite: config.defaultVideoSite || null,
         current: store.current().id,
         boards: store.list(),
       });
     }
     if (is('POST', 'generate')) return send(response, 200, await generate(await readJson(request), agent));
+    if (is('POST', 'videos')) return send(response, 200, await startVideo(await readJson(request), agent));
+    if (is('POST', 'frames', null)) {
+      const answer = frameRequests.get(path[1]);
+      if (!answer) throw new HttpError(404, '这个画面请求已完成或已过期');
+      const bytes = await readBody(request, 64 * 1024 * 1024);
+      try {
+        inspectImage(bytes);
+      } catch {
+        throw new HttpError(400, '画面不是有效图片');
+      }
+      frameRequests.delete(path[1]);
+      answer(bytes);
+      return send(response, 200, { ok: true });
+    }
+    // What is on a board, for agents: every item with what it was made from and the selection.
+    if (is('GET', 'canvas')) {
+      const wanted = url.searchParams.get('board');
+      const board = wanted ? store.get(wanted) : store.current();
+      const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit')) || 30));
+      const parents = (id: string) => board.edges.filter((e) => e.target === id).map((e) => e.source);
+      return send(response, 200, {
+        board: { id: board.id, title: board.title, count: board.images.length },
+        boards: store.list(),
+        selected: (selection.get(board.id) || []).filter((id) => board.images.some((i) => i.id === id)),
+        items: board.images.slice(-limit).map((item) => ({
+          id: item.id,
+          type: isVideo(item) ? 'video' : item.kind === 'frame' ? 'frame' : item.kind === 'import' ? 'import' : 'image',
+          path: store.imagePath(board, item),
+          width: item.width,
+          height: item.height,
+          ...(item.duration ? { duration: item.duration } : {}),
+          prompt: item.prompt,
+          model: item.model,
+          site: item.site,
+          ...(item.frame ? { frame: item.frame } : {}),
+          from: parents(item.id),
+          createdAt: item.createdAt,
+        })),
+        pending: [...pending.values()].filter((p) => p.boardId === board.id),
+      });
+    }
+    // A look at one item: the picture itself, or a keyframe sheet for a video.
+    if (is('GET', 'items', null, 'view')) {
+      const found = store.find(path[1]);
+      if (!found) throw new HttpError(404, `画布上没有 id 为 ${path[1].slice(0, 40)} 的内容`);
+      const { board, image: item } = found;
+      const file = store.imagePath(board, item);
+      let picture: { mime: string; data: string } | undefined, note = '';
+      if (isVideo(item)) {
+        const bytes = await sheet(board, item);
+        picture = { mime: inspectImage(bytes).mime, data: Buffer.from(bytes).toString('base64') };
+        note = '四格依次为视频 0、¼、½、¾ 处的画面（左上 → 右上 → 左下 → 右下）';
+      } else if (statSync(file).size <= 4 * 1024 * 1024)
+        picture = { mime: item.mime, data: readFileSync(file).toString('base64') };
+      else note = '图片超过 4 MB，未内联返回，请直接读取文件';
+      return send(response, 200, {
+        item: { ...item, path: file, board: { id: board.id, title: board.title } },
+        picture,
+        note,
+      });
+    }
+    if (is('POST', 'items', null, 'frame')) {
+      const found = store.find(path[1]);
+      if (!found || !isVideo(found.image)) throw new HttpError(404, '找不到这个视频');
+      const at = parseFrameAt((await readJson(request)).at);
+      if (at === null) throw new HttpError(400, '位置应为 first、last 或秒数');
+      if (typeof at === 'number' && found.image.duration && at > found.image.duration)
+        throw new HttpError(400, `视频只有 ${found.image.duration} 秒`);
+      const item = await frameNode(found.board, found.image, at, agent);
+      const file = store.imagePath(found.board, item);
+      return send(response, 200, {
+        id: item.id,
+        path: file,
+        width: item.width,
+        height: item.height,
+        label: frameLabel(at),
+        board: { id: found.board.id, title: found.board.title },
+        picture: { mime: item.mime, data: readFileSync(file).toString('base64') },
+      });
+    }
+    if (is('GET', 'videos'))
+      return send(response, 200, { jobs: [...jobs.values()].reverse() });
+    if (is('GET', 'videos', null)) {
+      const job = jobs.get(path[1]);
+      if (!job) throw new HttpError(404, '视频任务不存在（画布服务重启后任务记录会清空）');
+      return send(response, 200, job);
+    }
     if (is('POST', 'shutdown')) {
       if (!agent) throw new HttpError(403, '拒绝访问');
       send(response, 200, { ok: true });
@@ -384,6 +732,14 @@ export async function startDaemon(
           ...board,
           pending: [...pending.values()].filter((p) => p.boardId === board.id),
         });
+      if (is('POST', 'boards', null, 'selection')) {
+        const ids = (await readJson(request)).ids;
+        selection.set(
+          board.id,
+          (Array.isArray(ids) ? ids : []).filter((id): id is string => typeof id === 'string').slice(0, 100),
+        );
+        return send(response, 200, { ok: true });
+      }
       if (is('POST', 'boards', null, 'select')) {
         store.select(board.id);
         emit();
@@ -421,18 +777,8 @@ export async function startDaemon(
         return send(response, 200, image);
       }
       if (path[2] === 'images' && path[3]) {
-        if (is('GET', 'boards', null, 'images', null)) {
-          const { image, bytes } = store.read(board, path[3]);
-          response.writeHead(200, {
-            'Content-Type': image.mime,
-            'Content-Length': bytes.byteLength,
-            'Cache-Control': 'private, max-age=31536000, immutable',
-            ...(url.searchParams.has('download')
-              ? { 'Content-Disposition': `attachment; filename="canvas-${image.file}"` }
-              : {}),
-          });
-          return response.end(bytes);
-        }
+        if (is('GET', 'boards', null, 'images', null))
+          return serveMedia(request, response, board, path[3], url.searchParams.has('download'));
         if (is('DELETE', 'boards', null, 'images', null)) {
           store.removeImage(board, path[3]);
           emit(board.id);
@@ -441,34 +787,46 @@ export async function startDaemon(
       }
     }
 
-    if (path[0] === 'sites' && path[1]) {
+    // Image sites live under /api/sites and video sites under /api/video-sites. They work the
+    // same way but are separate lists, each with its own keys and default.
+    if ((path[0] === 'sites' || path[0] === 'video-sites') && path[1]) {
+      const video = path[0] === 'video-sites';
       const config = loadConfig();
-      const current = config.sites.find((s) => s.id === path[1]);
-      if (is('PUT', 'sites', null)) {
-        const site = normalizeSite({ ...(await readJson(request)), id: path[1] }, current?.apiKey);
-        const sites = current
-          ? config.sites.map((s) => (s.id === site.id ? site : s))
-          : [...config.sites, site];
-        saveConfig({ sites, defaultSite: config.defaultSite || site.id });
+      const list: Array<Site | VideoSite> = video ? config.videoSites : config.sites;
+      const fallback = video ? config.defaultVideoSite : config.defaultSite;
+      const update = (next: Array<Site | VideoSite>, preferred?: string) =>
+        saveConfig({
+          ...config,
+          ...(video
+            ? { videoSites: next as VideoSite[], defaultVideoSite: preferred }
+            : { sites: next as Site[], defaultSite: preferred }),
+        });
+      const current = list.find((s) => s.id === path[1]);
+      if (is('PUT', path[0], null)) {
+        const body = { ...(await readJson(request)), id: path[1] };
+        const site = video
+          ? normalizeVideoSite(body, current?.apiKey)
+          : normalizeSite(body, current?.apiKey);
+        update(
+          current ? list.map((s) => (s.id === site.id ? site : s)) : [...list, site],
+          fallback || site.id,
+        );
         emit();
         return send(response, 200, publicSite(site));
       }
       if (!current) throw new HttpError(404, '站点不存在');
-      if (is('DELETE', 'sites', null)) {
-        const sites = config.sites.filter((s) => s.id !== current.id);
-        saveConfig({
-          sites,
-          defaultSite: config.defaultSite === current.id ? sites[0]?.id : config.defaultSite,
-        });
+      if (is('DELETE', path[0], null)) {
+        const rest = list.filter((s) => s.id !== current.id);
+        update(rest, fallback === current.id ? rest[0]?.id : fallback);
         emit();
         return send(response, 200, { ok: true });
       }
-      if (is('POST', 'sites', null, 'default')) {
-        saveConfig({ ...config, defaultSite: current.id });
+      if (is('POST', path[0], null, 'default')) {
+        update(list, current.id);
         emit();
         return send(response, 200, { ok: true });
       }
-      if (is('POST', 'sites', null, 'models')) {
+      if (is('POST', path[0], null, 'models')) {
         if (!current.apiKey) throw new HttpError(409, '请先填写并保存 API Key');
         return send(response, 200, await listModels(current, shutdown.signal));
       }

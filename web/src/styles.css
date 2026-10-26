@@ -387,6 +387,35 @@ button.primary:hover:not(:disabled) {
 .controls select {
   max-width: 170px;
 }
+.mode-switch {
+  display: inline-flex;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+.mode-switch button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+}
+.mode-switch button[aria-pressed='true'] {
+  background: var(--bg);
+  color: var(--text);
+  box-shadow: 0 1px 3px #0000001a;
+}
+.image-node video {
+  display: block;
+  border-radius: 10px;
+  object-fit: contain;
+  background: #000;
+}
 .refs {
   display: flex;
   align-items: center;
@@ -405,7 +434,8 @@ button.primary:hover:not(:disabled) {
   overflow: hidden;
   background: var(--panel);
 }
-.refs img {
+.refs img,
+.refs video {
   width: 100%;
   height: 100%;
   object-fit: cover;
@@ -550,6 +580,21 @@ code {
 .site-list button:hover,
 .site-list button.active {
   background: var(--hover);
+}
+.site-list .site-group {
+  padding: 10px 10px 2px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+.site-list .site-group:first-child {
+  padding-top: 2px;
+}
+.site-form .form-kind {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
 }
 .site-list small,
 .site-form small {

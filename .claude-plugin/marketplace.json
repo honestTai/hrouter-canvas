@@ -9,7 +9,7 @@
     {
       "name": "hrouter-canvas",
       "source": "./",
-      "description": "Image generation with an infinite canvas for agents that cannot draw natively."
+      "description": "Image and video generation with an infinite canvas for agents that cannot draw natively."
     }
   ]
 }

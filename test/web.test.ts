@@ -30,18 +30,26 @@ const image = (id: string, x: number, kind: string) => ({
 const state = {
   version: 'test',
   defaultSite: 'mine',
+  defaultVideoSite: 'hrouter-video',
   current: 'b1',
   boards: [{ id: 'b1', title: '品牌海报', updatedAt: 1, count: 2 }],
   sites: [
     { id: 'mine', name: 'Mine', baseUrl: 'https://img.example', protocol: 'auto', models: ['gpt-image-2', 'gemini-3.1-flash-image'], hasKey: true, keyHint: '…cdef' },
     { id: 'hrouter', name: 'HRouter', baseUrl: 'https://hrouter.net', protocol: 'auto', models: [], hasKey: false, keyHint: '' },
   ],
+  videoSites: [
+    { id: 'hrouter-video', name: 'HRouter 视频', baseUrl: 'https://hrouter.net', protocol: 'auto', models: ['grok-imagine-video-1.5'], defaultModel: 'grok-imagine-video-1.5', hasKey: true, keyHint: '…9999' },
+  ],
 };
 const board = {
   id: 'b1',
   title: '品牌海报',
   viewport: { x: 0, y: 0, zoom: 1 },
-  images: [image('aaaaaaaaaaaaaaaa', 0, 'import'), image('bbbbbbbbbbbbbbbb', 430, 'generated')],
+  images: [
+    image('aaaaaaaaaaaaaaaa', 0, 'import'),
+    image('bbbbbbbbbbbbbbbb', 430, 'generated'),
+    { ...image('dddddddddddddddd', 860, 'generated'), file: 'dddddddddddddddd.mp4', mime: 'video/mp4', duration: 8, model: 'grok-imagine-video-1.5' },
+  ],
   edges: [{ id: 'cccccccccccccccc', source: 'aaaaaaaaaaaaaaaa', target: 'bbbbbbbbbbbbbbbb' }],
   pending: [{ id: 'p1', prompt: 'x', model: 'gpt-image-2', startedAt: Date.now() }],
 };
@@ -86,6 +94,8 @@ function install(url: string) {
       if (input === '/api/state') return reply(200, state);
       if (input === '/api/boards/b1' && method === 'GET') return reply(200, board);
       if (input === '/api/generate') return reply(200, { images: [{}], errors: [] });
+      if (input === '/api/videos') return reply(200, { id: 'v000000000001', status: 'running' });
+      if (input === '/api/videos/v000000000001') return reply(200, { id: 'v000000000001', status: 'failed', error: '视频生成失败（任务 vid-1）：moderation blocked' });
       return reply(200, { ok: true });
     },
   });
@@ -141,7 +151,9 @@ test('the canvas page renders the board and generates with the chosen options', 
   assert.equal(window.location.hash, '');
 
   assert.match(document.body.textContent!, /HRouter Canvas/);
-  assert.equal(document.querySelectorAll('.image-node').length, 2);
+  assert.equal(document.querySelectorAll('.image-node').length, 3);
+  assert.equal(document.querySelector('.image-node video')!.getAttribute('src'), '/api/boards/b1/images/dddddddddddddddd');
+  assert.match(document.querySelectorAll('.image-dimensions')[2].textContent!, /1536×1024 · 8s/);
   assert.equal(
     document.querySelector('.image-node img')!.getAttribute('src'),
     '/api/boards/b1/images/aaaaaaaaaaaaaaaa',
@@ -149,7 +161,10 @@ test('the canvas page renders the board and generates with the chosen options', 
   assert.match(document.querySelector('.generation-status')!.textContent!, /正在生成 1 张 · gpt-image-2/);
   // `#settings` opens the site settings, and the stored key is never rendered.
   const dialog = document.querySelector('[role="dialog"]')!;
-  assert.match(dialog.textContent!, /生图站点/);
+  // Image and video sites are separate lists in the settings.
+  const groups = [...dialog.querySelectorAll('.site-group')].map((g: any) => g.textContent);
+  assert.deepEqual(groups, ['生图站点', '生视频站点']);
+  assert.match(dialog.querySelector('.site-list')!.textContent!, /HRouter 视频默认/);
   assert.equal((dialog.querySelector('input[type="password"]') as any).value, '');
   await page.act(() => (dialog.querySelector('[aria-label="关闭"]') as any).click());
   assert.equal(document.querySelector('[role="dialog"]'), null);
@@ -179,6 +194,37 @@ test('the canvas page renders the board and generates with the chosen options', 
     count: 1,
   });
   assert.equal(textarea.value, '');
+  await unmount();
+  assert.deepEqual(errors, []);
+});
+
+test('an image on the canvas becomes the first frame of a video on the video site', async () => {
+  calls.length = 0;
+  const { window, document, unmount } = await mount('http://127.0.0.1:17861/');
+  await page.act(() => (document.querySelector('[aria-label="用这张图生成视频"]') as any).click());
+  assert.match(document.querySelector('.refs')!.textContent!, /首帧/);
+  const options = (label: string) =>
+    [...document.querySelectorAll(`.composer select[aria-label="${label}"] option`)].map((o: any) => o.textContent);
+  // Only sites with video models are offered, independent of the image default.
+  assert.deepEqual(options('站点'), ['HRouter 视频']);
+  assert.deepEqual(options('模型'), ['grok-imagine-video-1.5']);
+  assert.equal(document.querySelector('.composer select[aria-label="画面比例"]'), null);
+  const textarea = document.querySelector('.composer textarea') as any;
+  await page.act(() => {
+    Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')!.set!.call(textarea, '海浪慢慢涌来');
+    textarea.dispatchEvent(new window.Event('input', { bubbles: true }));
+  });
+  await page.act(() => (document.querySelector('.composer button.primary') as any).click());
+  await page.act(() => new Promise((resolve) => setTimeout(resolve, 3200)));
+  await settle();
+  assert.deepEqual(calls.find((c) => c.url === '/api/videos')!.body, {
+    prompt: '海浪慢慢涌来',
+    boardId: 'b1',
+    site: 'hrouter-video',
+    model: 'grok-imagine-video-1.5',
+    image: 'aaaaaaaaaaaaaaaa',
+  });
+  assert.match(document.querySelector('.notice.bad')!.textContent!, /moderation blocked/);
   await unmount();
   assert.deepEqual(errors, []);
 });
