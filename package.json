@@ -1,6 +1,6 @@
 {
   "name": "hrouter-canvas-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Infinite-canvas image and video generation for coding agents: an MCP server plus a local canvas, for any OpenAI-Images or Gemini compatible site, with image-to-video via HRouter or other video sites.",
   "license": "MIT",
   "type": "module",

@@ -1,6 +1,6 @@
 {
   "name": "hrouter-canvas",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Image and video generation with an infinite canvas for agents that cannot draw natively. Images from any OpenAI Images or Gemini compatible site; image-to-video via HRouter or another video site you configure.",
   "author": { "name": "HRouter", "url": "https://hrouter.net" },
   "homepage": "https://github.com/honestTai/hrouter-canvas",
