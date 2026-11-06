@@ -100,6 +100,12 @@ export async function runMcp(): Promise<void> {
           .max(8)
           .optional()
           .describe('Absolute file paths, or image ids from a previous result or list_canvas, to edit or use as visual reference. For a video, call extract_frame first and pass the frame id.'),
+        animated: z
+          .boolean()
+          .optional()
+          .describe('Make an animated GIF instead of a still. Only gpt-image-2.6-flare / gpt-image-2.6-sunburst support it, text-to-image only (no reference_images). Set model to one of those unless it is already the default.'),
+        frame_count: z.number().int().min(2).max(16).optional().describe('GIF frames, 2-16. Default 9. Only with animated.'),
+        frame_duration_ms: z.number().int().min(20).max(5000).optional().describe('Milliseconds each GIF frame is shown. Default 200. Only with animated.'),
         count: z.number().int().min(1).max(4).optional().describe('How many variations to generate. Default 1.'),
         save_to: z
           .string()
@@ -121,6 +127,9 @@ export async function runMcp(): Promise<void> {
             aspectRatio: input.aspect_ratio,
             resolution: input.resolution,
             references: input.reference_images,
+            animated: input.animated,
+            frameCount: input.frame_count,
+            frameDurationMs: input.frame_duration_ms,
             count: input.count,
             saveTo: input.save_to,
             model: input.model,

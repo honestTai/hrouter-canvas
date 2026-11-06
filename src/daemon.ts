@@ -220,7 +220,7 @@ export async function startDaemon(
 
   function exportCopy(board: Board, image: CanvasImage, saveTo: string, index: number): string {
     const extension = imageExtension(image.mime);
-    const named = /\.(png|jpe?g|webp|mp4)$/i.test(saveTo);
+    const named = /\.(png|jpe?g|webp|gif|mp4)$/i.test(saveTo);
     let stem = named
       ? saveTo.replace(/\.[^.]+$/, '') + (index ? `-${index + 1}` : '')
       : join(saveTo, `${slug(image.prompt)}-${image.id.slice(0, 6)}`);
@@ -246,6 +246,16 @@ export async function startDaemon(
     const resolution = body.resolution || undefined;
     if (resolution !== undefined && resolution !== '1K' && resolution !== '2K' && resolution !== '4K')
       throw new HttpError(400, '分辨率只能是 1K、2K 或 4K');
+    let animation: { frameCount: number; frameDurationMs: number } | undefined;
+    if (body.animated === true) {
+      const frameCount = body.frameCount === undefined ? 9 : Number(body.frameCount);
+      const frameDurationMs = body.frameDurationMs === undefined ? 200 : Number(body.frameDurationMs);
+      if (!Number.isInteger(frameCount) || frameCount < 2 || frameCount > 16)
+        throw new HttpError(400, 'GIF 帧数应为 2 到 16');
+      if (!Number.isInteger(frameDurationMs) || frameDurationMs < 20 || frameDurationMs > 5000)
+        throw new HttpError(400, 'GIF 每帧时长应为 20 到 5000 毫秒');
+      animation = { frameCount, frameDurationMs };
+    }
     const saveTo = agent && typeof body.saveTo === 'string' && body.saveTo ? body.saveTo : '';
     if (saveTo && !isAbsolute(saveTo)) throw new HttpError(400, 'save_to 必须是绝对路径');
     const site = resolveSite(loadConfig(), typeof body.site === 'string' ? body.site : undefined);
@@ -280,7 +290,7 @@ export async function startDaemon(
         marks.map((mark) =>
           generateImage(
             site,
-            { model, prompt, aspectRatio, resolution, references: refs },
+            { model, prompt, aspectRatio, resolution, references: refs, animation },
             shutdown.signal,
           ).finally(() => pending.delete(mark.id)),
         ),

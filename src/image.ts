@@ -1,5 +1,5 @@
 export interface ImageInfo {
-  mime: 'image/png' | 'image/jpeg' | 'image/webp';
+  mime: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';
   width: number;
   height: number;
 }
@@ -38,6 +38,10 @@ export function inspectImage(bytes: Uint8Array): ImageInfo {
       width = view.getUint16(26, true) & 16383;
       height = view.getUint16(28, true) & 16383;
     }
+  } else if (bytes.length >= 10 && (text(0, 6) === 'GIF87a' || text(0, 6) === 'GIF89a')) {
+    mime = 'image/gif';
+    width = view.getUint16(6, true);
+    height = view.getUint16(8, true);
   } else if (bytes.length >= 4 && bytes[0] === 255 && bytes[1] === 216) {
     mime = 'image/jpeg';
     let i = 2;
@@ -61,14 +65,14 @@ export function inspectImage(bytes: Uint8Array): ImageInfo {
       i += size;
     }
   } else {
-    throw new Error('仅支持 PNG、JPEG、WebP 图片');
+    throw new Error('仅支持 PNG、JPEG、WebP、GIF 图片');
   }
   if (!width || !height || width > 16384 || height > 16384 || width * height > 40_000_000)
     throw new Error('图片尺寸无效或超过 4000 万像素');
   return { mime, width, height };
 }
 export const imageExtension = (mime: string) =>
-  mime === 'video/mp4' ? 'mp4' : mime === 'image/jpeg' ? 'jpg' : mime === 'image/webp' ? 'webp' : 'png';
+  mime === 'video/mp4' ? 'mp4' : mime === 'image/jpeg' ? 'jpg' : mime === 'image/webp' ? 'webp' : mime === 'image/gif' ? 'gif' : 'png';
 
 export interface VideoInfo {
   mime: 'video/mp4';

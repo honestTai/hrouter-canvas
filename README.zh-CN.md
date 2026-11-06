@@ -98,6 +98,8 @@ Claude Code 插件已包含技能。其他 agent 可以把本仓库的 `skills/i
 
 **配置站点。** 第一次让 agent 画图或生视频时，如果还没有可用的站点，画布的设置页会自动打开。每个站点填三样东西：站点地址、API Key、模型。设置页分成生图站点和生视频站点两个列表，各自填地址和 Key，各有一个默认站点。图可以在站点 1 生成，再交给站点 2 生成视频，agent 不需要指定。两个列表都内置了 [HRouter](https://hrouter.net) 预设，填上 Key 即可使用：生图预设带 `gpt-image-2`、`gemini-3.1-flash-image`，生视频预设“HRouter 视频”带 `grok-imagine-video-1.5`（默认）和 `grok-imagine-video`。HRouter 的 Key 按分组区分能力，生视频需要 grok 分组的 Key（见 [HRouter 生图与生视频文档](https://hrouter.net/docs/image-video/)），所以两边通常填不同的 Key。
 
+**GIF 动图。** 站点支持 `gpt-image-2.6-flare` 或 `gpt-image-2.6-sunburst` 时，把它加为模型，`generate_image` 传 `animated: true`（可选 `frame_count` 2–16、`frame_duration_ms`）即可生成 GIF，仅支持文生图。
+
 没有浏览器的环境（SSH、容器、CI）可以改用环境变量，写在 agent 的 MCP 配置里：`HROUTER_CANVAS_BASE_URL`（站点地址）、`HROUTER_CANVAS_API_KEY`、`HROUTER_CANVAS_MODEL`、`HROUTER_CANVAS_PROTOCOL`（`auto`（默认）、`openai` 或 `gemini`）、`HROUTER_CANVAS_VIDEO_MODEL`（设置后添加一个生视频站点，并设为默认）、`HROUTER_CANVAS_VIDEO_BASE_URL`（不填则同 `HROUTER_CANVAS_BASE_URL`）、`HROUTER_CANVAS_VIDEO_API_KEY`（不填则同 `HROUTER_CANVAS_API_KEY`）、`HROUTER_CANVAS_VIDEO_PROTOCOL`（`auto`（默认）、`xai` 或 `openai`）、`HROUTER_CANVAS_OPEN`（`never` 则从不自动打开浏览器）、`HROUTER_CANVAS_FFMPEG`（读取视频关键帧用的 ffmpeg 路径，默认在 PATH 中查找；`off` 则只用画布页面解码）、`HROUTER_CANVAS_PORT`（默认 17861）、`HROUTER_CANVAS_HOME`（默认 `~/.hrouter-canvas`）。
 
 协议选“自动”时，`gemini-` 开头的模型走 Gemini 原生，其余走 OpenAI Images。视频协议选“自动”时，`sora-` 开头的模型走 OpenAI Videos，其余走 HRouter / xAI。

@@ -30,6 +30,9 @@ If you do have native image generation, prefer it unless the user asks for the c
    - `save_to`: when the image belongs in the project, pass the absolute target directory or file
      path so a copy is written there. Nothing is ever overwritten.
    - `count`: only when the user wants options.
+   - `animated`: set `true` for a GIF / moving picture (动图、GIF). Needs `model` `gpt-image-2.6-flare` or
+     `gpt-image-2.6-sunburst`, text-to-image only; tune with `frame_count` (2-16, default 9) and
+     `frame_duration_ms` (default 200). Do not combine with `reference_images`.
 2. Tell the user the saved path and that it is on the canvas. Do not read the file back just to
    describe it unless they ask.
 3. To refine, call `generate_image` again with the previous image id in `reference_images`.

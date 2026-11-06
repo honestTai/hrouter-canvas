@@ -17,6 +17,8 @@ export interface GenerationInput {
   aspectRatio?: AspectRatio;
   resolution?: '1K' | '2K' | '4K';
   references: Reference[];
+  // Animated GIF (gpt-image-2.6 only): text-to-image, 2-16 frames.
+  animation?: { frameCount: number; frameDurationMs: number };
 }
 export interface GeneratedImage extends ImageInfo {
   bytes: Uint8Array;
@@ -207,6 +209,10 @@ async function generateOpenAI(
   input: GenerationInput,
   signal: AbortSignal,
 ): Promise<GeneratedImage> {
+  if (input.animation && !/^gpt-image-2\.6-/i.test(input.model))
+    throw new HttpError(400, 'GIF 动图目前只有 gpt-image-2.6-flare / gpt-image-2.6-sunburst 支持');
+  if (input.animation && input.references.length)
+    throw new HttpError(400, 'GIF 动图只能文生图，不能带参考图');
   const { size, exact } = openaiSize(input.model, input.aspectRatio);
   const prompt =
     input.aspectRatio && !exact
@@ -232,7 +238,19 @@ async function generateOpenAI(
   } else {
     path = '/images/generations';
     headers.set('Content-Type', 'application/json');
-    body = JSON.stringify({ model: input.model, prompt, n: 1, ...(size ? { size } : {}) });
+    body = JSON.stringify({
+      model: input.model,
+      prompt,
+      n: 1,
+      ...(size ? { size } : {}),
+      ...(input.animation
+        ? {
+            output_format: 'gif',
+            frame_count: input.animation.frameCount,
+            frame_duration_ms: input.animation.frameDurationMs,
+          }
+        : {}),
+    });
   }
   const response = await request(
     openaiRoot(site.baseUrl) + path,
@@ -243,7 +261,7 @@ async function generateOpenAI(
   const first = (await json(response, '读取生图接口响应', signal))?.data?.[0];
   if (typeof first?.b64_json === 'string' && first.b64_json) return decode(first.b64_json);
   if (typeof first?.url === 'string') {
-    const data = /^data:image\/(?:png|jpeg|webp);base64,(.+)$/s.exec(first.url);
+    const data = /^data:image\/(?:png|jpeg|webp|gif);base64,(.+)$/s.exec(first.url);
     return data ? decode(data[1]) : download(site, first.url, signal);
   }
   throw new HttpError(502, '站点没有返回图片（响应中既没有 b64_json 也没有 url）');

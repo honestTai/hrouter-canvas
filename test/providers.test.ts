@@ -46,3 +46,23 @@ test('a shutdown during response reading is reported as cancellation', async (t)
     return true;
   });
 });
+
+test('animated GIF sends output_format and frame params, only for gpt-image-2.6 text-to-image', async (t) => {
+  const gif = Buffer.from([71, 73, 70, 56, 57, 97, 2, 0, 3, 0, 0, 0, 0, 0x3b]);
+  let sent: any;
+  t.mock.method(globalThis, 'fetch', async (_url: unknown, init: any) => {
+    sent = JSON.parse(init.body);
+    return Response.json({ data: [{ b64_json: gif.toString('base64') }] });
+  });
+  const animation = { frameCount: 6, frameDurationMs: 150 };
+  const result = await generateImage(site, { model: 'gpt-image-2.6-flare', prompt: 'wave', references: [], animation }, new AbortController().signal);
+  assert.equal(sent.output_format, 'gif');
+  assert.equal(sent.frame_count, 6);
+  assert.equal(sent.frame_duration_ms, 150);
+  assert.deepEqual([result.mime, result.width, result.height], ['image/gif', 2, 3]);
+  await assert.rejects(generateImage(site, { model: 'gpt-image-2', prompt: 'x', references: [], animation }, new AbortController().signal), /gpt-image-2\.6/);
+  await assert.rejects(
+    generateImage(site, { model: 'gpt-image-2.6-flare', prompt: 'x', references: [{ bytes: new Uint8Array(1), mime: 'image/png' }], animation }, new AbortController().signal),
+    /不能带参考图/,
+  );
+});
