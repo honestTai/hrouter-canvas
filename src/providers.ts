@@ -117,11 +117,112 @@ export async function upstreamError(response: Response): Promise<HttpError> {
         ? '额度不足或请求过于频繁'
         : status === 404
           ? '接口或模型不存在，请检查站点地址、协议类型和模型名'
-          : '站点返回错误';
+          : status === 504 || status === 524
+            ? '站点网关等待上游响应超时，服务端可能仍在生成，请勿盲目重试以免重复扣费'
+            : '站点返回错误';
   return new HttpError(
     status === 401 || status === 403 ? 403 : status === 402 || status === 429 ? 429 : 502,
     `${reason}（HTTP ${status}）${detail ? `：${detail}` : ''}`,
   );
+}
+
+const isEventStream = (response: Response) =>
+  /\btext\/event-stream\b/i.test(response.headers.get('content-type') || '');
+
+export interface SseEvent {
+  event: string;
+  data: string;
+}
+
+// Streaming responses send headers and periodic SSE heartbeats early, keeping reverse proxies
+// such as Cloudflare (125s Proxy Read Timeout → HTTP 524) alive during slow 4K generations.
+export async function* sseEvents(
+  response: Response,
+  limit: number,
+  stage = '读取站点响应',
+  signal?: AbortSignal,
+): AsyncGenerator<SseEvent> {
+  const reader = response.body?.getReader();
+  if (!reader) return;
+  const decoder = new TextDecoder();
+  let size = 0,
+    buffer = '',
+    event = '',
+    data: string[] = [],
+    finished = false;
+  const consumeLine = (raw: string): SseEvent | undefined => {
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+    if (!line) {
+      if (!data.length) {
+        event = '';
+        return undefined;
+      }
+      const out = { event: event || 'message', data: data.join('\n') };
+      event = '';
+      data = [];
+      return out;
+    }
+    if (line.startsWith(':')) return undefined;
+    const colon = line.indexOf(':');
+    const field = colon < 0 ? line : line.slice(0, colon);
+    const value = colon < 0 ? '' : line.slice(colon + (line[colon + 1] === ' ' ? 2 : 1));
+    if (field === 'event') event = value;
+    else if (field === 'data') data.push(value);
+    return undefined;
+  };
+  try {
+    for (;;) {
+      const { value, done } = await reader.read().catch((error: unknown) => {
+        throw bodyReadError(error, stage, signal);
+      });
+      if (done) {
+        finished = true;
+        buffer += decoder.decode();
+        break;
+      }
+      size += value.byteLength;
+      if (size > limit) {
+        await reader.cancel().catch(() => {});
+        finished = true;
+        throw new HttpError(502, '站点响应超过安全大小上限');
+      }
+      buffer += decoder.decode(value, { stream: true });
+      for (let nl; (nl = buffer.indexOf('\n')) >= 0; ) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        const flushed = consumeLine(line);
+        if (flushed) yield flushed;
+      }
+    }
+    if (buffer) {
+      const flushed = consumeLine(buffer);
+      if (flushed) yield flushed;
+    }
+    const tail = consumeLine('');
+    if (tail) yield tail;
+  } finally {
+    if (!finished) await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+function streamError(payload: any): HttpError {
+  const raw = payload?.error ?? payload;
+  const detail = String(
+    (typeof raw === 'string' ? raw : raw?.message || raw?.code || raw?.type || JSON.stringify(raw)) || '',
+  )
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 300);
+  const code = String(raw?.code || raw?.type || raw?.status || '').toLowerCase();
+  const numeric = typeof raw?.code === 'number' ? raw.code : 0;
+  if (numeric === 401 || numeric === 403 || /auth|invalid_api_key|permission|forbidden/.test(code))
+    return new HttpError(403, `API Key 无效或没有权限${detail ? `：${detail}` : ''}`);
+  if (numeric === 402 || numeric === 429 || /rate_limit|quota|exhausted|insufficient/.test(code))
+    return new HttpError(429, `额度不足或请求过于频繁${detail ? `：${detail}` : ''}`);
+  if (/moderation|safety|policy|content_policy|invalid_request|user_error/.test(code))
+    return new HttpError(422, `生图请求被拒绝${detail ? `：${detail}` : ''}`);
+  return new HttpError(502, `站点流式响应返回错误${detail ? `：${detail}` : ''}；未自动重试`);
 }
 
 export async function request(url: string, init: RequestInit, signal: AbortSignal): Promise<Response> {
@@ -218,47 +319,98 @@ async function generateOpenAI(
     input.aspectRatio && !exact
       ? `[Aspect ratio ${input.aspectRatio}, ${orientation(input.aspectRatio)} composition]\n\n${input.prompt}`
       : input.prompt;
-  const headers = authHeaders(site, 'openai');
-  let path: string, body: string | FormData;
-  if (input.references.length) {
-    path = '/images/edits';
-    const form = new FormData();
-    form.set('model', input.model);
-    form.set('prompt', prompt);
-    form.set('n', '1');
-    if (size) form.set('size', size);
-    input.references.forEach((ref, i) =>
-      form.append(
-        'image[]',
-        new Blob([ref.bytes as Uint8Array<ArrayBuffer>], { type: ref.mime }),
-        `reference-${i}.${ref.mime.split('/')[1]}`,
-      ),
-    );
-    body = form;
-  } else {
-    path = '/images/generations';
-    headers.set('Content-Type', 'application/json');
-    body = JSON.stringify({
-      model: input.model,
-      prompt,
-      n: 1,
-      ...(size ? { size } : {}),
-      ...(input.animation
-        ? {
-            output_format: 'gif',
-            frame_count: input.animation.frameCount,
-            frame_duration_ms: input.animation.frameDurationMs,
-          }
-        : {}),
-    });
+  // GPT image models support SSE streaming on both /images/generations and /images/edits, which
+  // lets gateways send periodic keepalives instead of hitting Cloudflare's 125s 524 timeout.
+  const streamable = /^gpt-image-/i.test(input.model) && !input.animation;
+  const send = (stream: boolean) => {
+    const headers = authHeaders(site, 'openai');
+    if (stream) headers.set('Accept', 'text/event-stream, application/json');
+    let path: string, body: string | FormData;
+    if (input.references.length) {
+      path = '/images/edits';
+      const form = new FormData();
+      form.set('model', input.model);
+      form.set('prompt', prompt);
+      form.set('n', '1');
+      if (size) form.set('size', size);
+      if (stream) form.set('stream', 'true');
+      input.references.forEach((ref, i) =>
+        form.append(
+          'image[]',
+          new Blob([ref.bytes as Uint8Array<ArrayBuffer>], { type: ref.mime }),
+          `reference-${i}.${ref.mime.split('/')[1]}`,
+        ),
+      );
+      body = form;
+    } else {
+      path = '/images/generations';
+      headers.set('Content-Type', 'application/json');
+      body = JSON.stringify({
+        model: input.model,
+        prompt,
+        n: 1,
+        ...(size ? { size } : {}),
+        ...(stream ? { stream: true } : {}),
+        ...(input.animation
+          ? {
+              output_format: 'gif',
+              frame_count: input.animation.frameCount,
+              frame_duration_ms: input.animation.frameDurationMs,
+            }
+          : {}),
+      });
+    }
+    return request(openaiRoot(site.baseUrl) + path, { method: 'POST', headers, body }, signal);
+  };
+  let response = await send(streamable);
+  if (!response.ok) {
+    const error = await upstreamError(response);
+    // Older OpenAI-compatible relays may reject `stream` during parameter validation before running.
+    if (
+      streamable &&
+      response.status === 400 &&
+      /(?:unknown|unsupported|invalid|unexpected|unrecognized)\s+(?:parameter|field|argument|option)[^a-z0-9]{0,16}stream\b|\bstream\b[^.:\n]{0,24}(?:not supported|is invalid|unrecognized|not allowed|not permitted)/i.test(
+        error.message,
+      )
+    ) {
+      response = await send(false);
+      if (!response.ok) throw await upstreamError(response);
+    } else {
+      throw error;
+    }
   }
-  const response = await request(
-    openaiRoot(site.baseUrl) + path,
-    { method: 'POST', headers, body },
-    signal,
-  );
-  if (!response.ok) throw await upstreamError(response);
-  const first = (await json(response, '读取生图接口响应', signal))?.data?.[0];
+  let first: { b64_json?: unknown; url?: unknown } | undefined;
+  if (isEventStream(response)) {
+    let nonPartial: { b64_json?: unknown; url?: unknown } | undefined;
+    for await (const { event, data } of sseEvents(
+      response,
+      MAX_GENERATION_RESPONSE_BYTES,
+      '读取生图接口响应',
+      signal,
+    )) {
+      const trimmed = data.trim();
+      if (!trimmed || trimmed === '[DONE]') continue;
+      let payload: any;
+      try {
+        payload = JSON.parse(trimmed);
+      } catch {
+        throw new HttpError(502, '站点返回的流式生图数据不是有效 JSON；未自动重试');
+      }
+      const type = String(payload?.type || event || '');
+      if (event === 'error' || type === 'error' || payload?.error) throw streamError(payload);
+      if (Array.isArray(payload?.data) && payload.data[0]) {
+        first = payload.data[0];
+        continue;
+      }
+      if (typeof payload?.b64_json === 'string' || typeof payload?.url === 'string') {
+        if (type.endsWith('.completed')) first = payload;
+        else if (!type.includes('partial')) nonPartial = payload;
+      }
+    }
+    first ??= nonPartial;
+  } else {
+    first = (await json(response, '读取生图接口响应', signal))?.data?.[0];
+  }
   if (typeof first?.b64_json === 'string' && first.b64_json) return decode(first.b64_json);
   if (typeof first?.url === 'string') {
     const data = /^data:image\/(?:png|jpeg|webp|gif);base64,(.+)$/s.exec(first.url);
@@ -272,46 +424,86 @@ async function generateGemini(
   input: GenerationInput,
   signal: AbortSignal,
 ): Promise<GeneratedImage> {
-  const headers = authHeaders(site, 'gemini');
-  headers.set('Content-Type', 'application/json');
   const imageConfig = {
     ...(input.aspectRatio ? { aspectRatio: input.aspectRatio } : {}),
     ...(input.resolution ? { imageSize: input.resolution } : {}),
   };
-  const response = await request(
-    `${geminiRoot(site.baseUrl)}/models/${encodeURIComponent(input.model)}:generateContent`,
-    {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              { text: input.prompt },
-              ...input.references.map((ref) => ({
-                inlineData: { mimeType: ref.mime, data: Buffer.from(ref.bytes).toString('base64') },
-              })),
-            ],
-          },
+  const body = JSON.stringify({
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          { text: input.prompt },
+          ...input.references.map((ref) => ({
+            inlineData: { mimeType: ref.mime, data: Buffer.from(ref.bytes).toString('base64') },
+          })),
         ],
-        generationConfig: {
-          responseModalities: ['TEXT', 'IMAGE'],
-          ...(Object.keys(imageConfig).length ? { imageConfig } : {}),
-        },
-      }),
+      },
+    ],
+    generationConfig: {
+      responseModalities: ['TEXT', 'IMAGE'],
+      ...(Object.keys(imageConfig).length ? { imageConfig } : {}),
     },
-    signal,
-  );
+  });
+  const base = `${geminiRoot(site.baseUrl)}/models/${encodeURIComponent(input.model)}`;
+  const send = (stream: boolean) => {
+    const headers = authHeaders(site, 'gemini');
+    headers.set('Content-Type', 'application/json');
+    if (stream) headers.set('Accept', 'text/event-stream, application/json');
+    return request(
+      stream ? `${base}:streamGenerateContent?alt=sse` : `${base}:generateContent`,
+      { method: 'POST', headers, body },
+      signal,
+    );
+  };
+  let response = await send(true);
+  // Relays that only mount :generateContent reject :streamGenerateContent before running.
+  if (response.status === 404 || response.status === 405) {
+    await response.body?.cancel().catch(() => {});
+    response = await send(false);
+  }
   if (!response.ok) throw await upstreamError(response);
-  const value = await json(response, '读取生图接口响应', signal);
-  let said = '';
-  for (const candidate of value?.candidates || [])
-    for (const part of candidate?.content?.parts || []) {
-      const image = part?.inlineData || part?.inline_data;
-      if (typeof image?.data === 'string' && image.data) return decode(image.data);
-      if (typeof part?.text === 'string') said += part.text;
+  let finalImage = '',
+    thoughtImage = '',
+    said = '';
+  const collect = (value: any) => {
+    if (value?.error) throw streamError(value);
+    const envelope = value?.response?.candidates ? value.response : value;
+    for (const candidate of envelope?.candidates || [])
+      for (const part of candidate?.content?.parts || []) {
+        const image = part?.inlineData || part?.inline_data;
+        if (typeof image?.data === 'string' && image.data) {
+          if (part?.thought) thoughtImage = image.data;
+          else finalImage = image.data;
+        } else if (typeof part?.text === 'string' && !part?.thought) {
+          said += part.text;
+        }
+      }
+  };
+  if (isEventStream(response)) {
+    for await (const { event, data } of sseEvents(
+      response,
+      MAX_GENERATION_RESPONSE_BYTES,
+      '读取生图接口响应',
+      signal,
+    )) {
+      const trimmed = data.trim();
+      if (!trimmed || trimmed === '[DONE]') continue;
+      let chunk: any;
+      try {
+        chunk = JSON.parse(trimmed);
+      } catch {
+        throw new HttpError(502, '站点返回的流式生图数据不是有效 JSON；未自动重试');
+      }
+      if (event === 'error') throw streamError(chunk);
+      collect(chunk);
     }
+  } else {
+    const value = await json(response, '读取生图接口响应', signal);
+    for (const item of Array.isArray(value) ? value : [value]) collect(item);
+  }
+  const chosen = finalImage || thoughtImage;
+  if (chosen) return decode(chosen);
   said = said.replace(/\s+/g, ' ').trim().slice(0, 200);
   throw new HttpError(
     422,

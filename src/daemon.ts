@@ -32,7 +32,15 @@ import {
   type Site,
   type VideoSite,
 } from './config.ts';
-import { ffmpegFrames, ffmpegPath, frameLabel, parseFrameAt, type FrameAt, type FrameRequest } from './frames.ts';
+import {
+  downscaleImage,
+  ffmpegFrames,
+  ffmpegPath,
+  frameLabel,
+  parseFrameAt,
+  type FrameAt,
+  type FrameRequest,
+} from './frames.ts';
 import { imageExtension, inspectImage, MAX_IMPORT_BYTES, normalizeAspectRatio } from './image.ts';
 import { generateImage, listModels, protocolFor, type Reference } from './providers.ts';
 import { Store, type Board, type CanvasImage } from './store.ts';
@@ -382,6 +390,50 @@ export async function startDaemon(
     writeFileSync(path, bytes);
     return bytes;
   }
+  const MAX_RAW_INLINE_BYTES = 768 * 1024;
+  const MAX_PREVIEW_INLINE_BYTES = 1536 * 1024;
+  // Keeps agent inspection lightweight so 2K/4K PNGs do not bloat conversation history and break
+  // context compaction, while leaving the lossless original untouched on disk.
+  async function inlinePicture(
+    board: Board,
+    item: CanvasImage,
+  ): Promise<{ picture?: { mime: string; data: string }; note: string }> {
+    const file = store.imagePath(board, item);
+    const size = statSync(file).size;
+    if (size <= MAX_RAW_INLINE_BYTES)
+      return { picture: { mime: item.mime, data: readFileSync(file).toString('base64') }, note: '' };
+    const cached = store.previewPath(board, item);
+    let preview: Uint8Array | null = existsSync(cached) ? new Uint8Array(readFileSync(cached)) : null;
+    if (!preview) {
+      preview = await downscaleImage(file, cached);
+      if (preview && !existsSync(cached)) {
+        try {
+          inspectImage(preview);
+          mkdirSync(dirname(cached), { recursive: true, mode: 0o700 });
+          writeFileSync(cached, preview);
+        } catch {
+          preview = null;
+        }
+      }
+    }
+    if (preview && preview.byteLength <= MAX_PREVIEW_INLINE_BYTES) {
+      try {
+        const info = inspectImage(preview);
+        return {
+          picture: { mime: info.mime, data: Buffer.from(preview).toString('base64') },
+          note: `已返回压缩预览图（磁盘原图仍为 ${item.width}×${item.height} 完整分辨率，请勿直接读取原图文件以免撑爆上下文）`,
+        };
+      } catch {
+        // Fall through if the preview bytes were invalid.
+      }
+    }
+    if (size <= MAX_PREVIEW_INLINE_BYTES)
+      return { picture: { mime: item.mime, data: readFileSync(file).toString('base64') }, note: '' };
+    return {
+      picture: undefined,
+      note: '原图体积较大，为避免上下文超限未内联返回；请勿直接读取原图字节，改图或生视频可直接传入该 id',
+    };
+  }
   // A still from a video becomes its own node, linked from the video, so it can be edited or
   // animated like any other image.
   async function frameNode(board: Board, video: CanvasImage, at: FrameAt, agent: boolean) {
@@ -687,9 +739,9 @@ export async function startDaemon(
         const bytes = await sheet(board, item);
         picture = { mime: inspectImage(bytes).mime, data: Buffer.from(bytes).toString('base64') };
         note = '四格依次为视频 0、¼、½、¾ 处的画面（左上 → 右上 → 左下 → 右下）';
-      } else if (statSync(file).size <= 4 * 1024 * 1024)
-        picture = { mime: item.mime, data: readFileSync(file).toString('base64') };
-      else note = '图片超过 4 MB，未内联返回，请直接读取文件';
+      } else {
+        ({ picture, note } = await inlinePicture(board, item));
+      }
       return send(response, 200, {
         item: { ...item, path: file, board: { id: board.id, title: board.title } },
         picture,
@@ -705,6 +757,7 @@ export async function startDaemon(
         throw new HttpError(400, `视频只有 ${found.image.duration} 秒`);
       const item = await frameNode(found.board, found.image, at, agent);
       const file = store.imagePath(found.board, item);
+      const { picture, note } = await inlinePicture(found.board, item);
       return send(response, 200, {
         id: item.id,
         path: file,
@@ -712,7 +765,8 @@ export async function startDaemon(
         height: item.height,
         label: frameLabel(at),
         board: { id: found.board.id, title: found.board.title },
-        picture: { mime: item.mime, data: readFileSync(file).toString('base64') },
+        picture,
+        note,
       });
     }
     if (is('GET', 'videos'))
