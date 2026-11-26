@@ -41,7 +41,7 @@ import {
   type FrameAt,
   type FrameRequest,
 } from './frames.ts';
-import { imageExtension, inspectImage, MAX_IMPORT_BYTES, normalizeAspectRatio } from './image.ts';
+import { imageExtension, imageHasAlpha, inspectImage, MAX_IMPORT_BYTES, normalizeAspectRatio } from './image.ts';
 import { generateImage, listModels, protocolFor, type Reference } from './providers.ts';
 import { Store, type Board, type CanvasImage } from './store.ts';
 import { generateVideo, videoProtocolFor } from './video.ts';
@@ -182,9 +182,51 @@ export async function startDaemon(
     response.end(JSON.stringify(body));
   };
 
+  const MAX_RAW_REFERENCE_BYTES = 1536 * 1024;
+  // Shrinks multi-MB 2K/4K reference images before uploading to /images/edits or video endpoints,
+  // avoiding 8+ MiB payloads that stall moderation and push total latency past Cloudflare's 125s cap.
+  async function slimReference(board: Board, image: CanvasImage): Promise<Reference> {
+    const raw = store.read(board, image.id).bytes;
+    if (raw.byteLength <= MAX_RAW_REFERENCE_BYTES) return { bytes: raw, mime: image.mime };
+    const alpha = imageHasAlpha(raw, image.mime);
+    const ext = alpha ? 'png' : 'jpg';
+    const cached = store.uploadCachePath(board, image, ext);
+    let slim: Uint8Array | null = existsSync(cached) ? new Uint8Array(readFileSync(cached)) : null;
+    if (!slim) {
+      const file = store.imagePath(board, image);
+      slim = await downscaleImage(file, cached, {
+        maxEdge: 2048,
+        format: alpha ? 'png' : 'jpeg',
+        quality: 88,
+      });
+      // If a noisy RGBA PNG is still > 2.5 MB at 2048px, step down once more to 1536px PNG.
+      if (alpha && slim && slim.byteLength > 2560 * 1024) {
+        rmSync(cached, { force: true });
+        slim = await downscaleImage(file, cached, { maxEdge: 1536, format: 'png' });
+      }
+      if (slim && slim.byteLength < raw.byteLength && !existsSync(cached)) {
+        try {
+          inspectImage(slim);
+          mkdirSync(dirname(cached), { recursive: true, mode: 0o700 });
+          writeFileSync(cached, slim);
+        } catch {
+          slim = null;
+        }
+      }
+    }
+    if (slim && slim.byteLength < raw.byteLength) {
+      try {
+        return { bytes: slim, mime: inspectImage(slim).mime };
+      } catch {
+        // Fall back to original bytes if cached/converted output was invalid.
+      }
+    }
+    return { bytes: raw, mime: image.mime };
+  }
+
   // References are canvas image ids; agents may also pass absolute paths, which are imported
   // onto the board first so the canvas shows what a result was made from.
-  function references(board: Board, value: unknown, agent: boolean) {
+  async function references(board: Board, value: unknown, agent: boolean) {
     const list = Array.isArray(value) ? value : [];
     if (list.length > 8) throw new HttpError(400, '最多使用 8 张参考图');
     const ids: string[] = [],
@@ -221,7 +263,7 @@ export async function startDaemon(
       if (isVideo(image))
         throw new HttpError(400, '视频不能直接用作参考图：先用 extract_frame（画布上的“截取帧”）取出一帧，再用那张图');
       ids.push(image.id);
-      refs.push({ bytes: store.read(board, image.id).bytes, mime: image.mime });
+      refs.push(await slimReference(board, image));
     }
     return { ids, refs };
   }
@@ -273,7 +315,7 @@ export async function startDaemon(
     if (!safeModel.test(model)) throw new HttpError(400, '模型名无效');
     const board =
       typeof body.boardId === 'string' && body.boardId ? store.get(body.boardId) : store.current();
-    const { ids, refs } = references(board, body.references, agent);
+    const { ids, refs } = await references(board, body.references, agent);
 
     const marks = Array.from({ length: count }, () => {
       const mark = {
@@ -490,7 +532,7 @@ export async function startDaemon(
     let start = body.image;
     const continued = typeof start === 'string' ? board.images.find((i) => i.id === start) : undefined;
     if (continued && isVideo(continued)) start = (await frameNode(board, continued, 'last', agent)).id;
-    const { ids, refs } = references(board, start ? [start] : [], agent);
+    const { ids, refs } = await references(board, start ? [start] : [], agent);
     const first = ids[0] ? board.images.find((i) => i.id === ids[0]) : undefined;
 
     const job: VideoJob = {

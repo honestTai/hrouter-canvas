@@ -305,6 +305,118 @@ function openaiSize(model: string, ratio?: AspectRatio): { size?: string; exact:
   return { exact: false };
 }
 
+const asyncUnavailableUntil = new Map<string, number>();
+const ASYNC_NEGATIVE_TTL_MS = 60_000;
+const ASYNC_IMAGE_MAX_WAIT_MS = 15 * 60_000;
+const ASYNC_IMAGE_MAX_POLL_FAILURES = 6;
+export const resetAsyncImageCache = () => asyncUnavailableUntil.clear();
+
+const abortableSleep = (ms: number, signal: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    if (signal.aborted) return reject(new HttpError(499, '已取消'));
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', stop);
+      resolve();
+    }, ms);
+    const stop = () => {
+      clearTimeout(timer);
+      reject(new HttpError(499, '已取消'));
+    };
+    signal.addEventListener('abort', stop, { once: true });
+  });
+
+function imagePollMs(retryAfter?: string | null): number {
+  const env = Number(process.env.HROUTER_CANVAS_IMAGE_POLL_MS);
+  if (env > 0) return env;
+  const hinted = Number(retryAfter);
+  if (Number.isFinite(hinted) && hinted > 0) return Math.min(10_000, Math.max(1000, hinted * 1000));
+  return 3000;
+}
+
+async function resolveImageItem(
+  site: Site,
+  item: { b64_json?: unknown; url?: unknown } | undefined,
+  signal: AbortSignal,
+): Promise<GeneratedImage> {
+  if (typeof item?.b64_json === 'string' && item.b64_json) return decode(item.b64_json);
+  if (typeof item?.url === 'string' && item.url) {
+    const data = /^data:image\/(?:png|jpeg|webp|gif);base64,(.+)$/s.exec(item.url);
+    return data ? decode(data[1]) : download(site, item.url, signal);
+  }
+  throw new HttpError(502, '站点没有返回图片（响应中既没有 b64_json 也没有 url）');
+}
+
+function asyncTaskFailure(polled: any, id: string): HttpError {
+  const status = Number(polled?.http_status) || 502;
+  const raw = polled?.error;
+  const detail = String(
+    (typeof raw === 'string' ? raw : raw?.message || raw?.code || raw?.type || '') || '',
+  )
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 300);
+  if (status === 401 || status === 403)
+    return new HttpError(403, `API Key 无效或没有权限（任务 ${id}）${detail ? `：${detail}` : ''}`);
+  if (status === 402 || status === 429)
+    return new HttpError(429, `额度不足或请求过于频繁（任务 ${id}）${detail ? `：${detail}` : ''}`);
+  if (status === 400 || status === 422)
+    return new HttpError(422, `生图请求被拒绝（任务 ${id}）${detail ? `：${detail}` : ''}`);
+  return new HttpError(502, `生图任务失败（任务 ${id}，HTTP ${status}）${detail ? `：${detail}` : ''}；未自动重试`);
+}
+
+async function pollOpenAIImageTask(
+  site: Site,
+  root: string,
+  initial: any,
+  initialRetryAfter: string | null,
+  signal: AbortSignal,
+): Promise<GeneratedImage> {
+  const rawId = initial?.task_id ?? initial?.id;
+  if (typeof rawId !== 'string' || !/^[\w.:-]{1,200}$/.test(rawId))
+    throw new HttpError(502, '站点没有返回有效的异步生图任务 ID');
+  const settle = (value: any): { b64_json?: unknown; url?: unknown } | undefined => {
+    const state = String(value?.status || '').toLowerCase();
+    if (state === 'completed' || state === 'succeeded' || state === 'done')
+      return value?.result?.data?.[0] ?? (typeof value?.image_url === 'string' ? { url: value.image_url } : undefined);
+    if (state === 'failed' || state === 'error' || state === 'expired' || state === 'cancelled' || state === 'canceled')
+      throw asyncTaskFailure(value, rawId);
+    return undefined;
+  };
+  const immediate = settle(initial);
+  if (immediate !== undefined) return resolveImageItem(site, immediate, signal);
+
+  const pollUrl = `${root}/images/tasks/${encodeURIComponent(rawId)}`;
+  const deadline = Date.now() + ASYNC_IMAGE_MAX_WAIT_MS;
+  let retryAfter = initialRetryAfter,
+    failures = 0;
+  for (;;) {
+    await abortableSleep(imagePollMs(retryAfter), signal);
+    let resp: Response;
+    try {
+      resp = await request(pollUrl, { headers: authHeaders(site, 'openai') }, signal);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      if (++failures >= ASYNC_IMAGE_MAX_POLL_FAILURES)
+        throw new HttpError(502, `查询生图任务 ${rawId} 连续失败：${(error as Error).message}；任务可能仍在生成，未重新提交`);
+      continue;
+    }
+    if (resp.status >= 500 || resp.status === 429) {
+      const err = await upstreamError(resp);
+      if (++failures >= ASYNC_IMAGE_MAX_POLL_FAILURES)
+        throw new HttpError(502, `查询生图任务 ${rawId} 连续失败：${err.message}；任务可能仍在生成，未重新提交`);
+      continue;
+    }
+    if (!resp.ok) throw await upstreamError(resp);
+    retryAfter = resp.headers.get('retry-after');
+    const current = await json(resp, '查询生图任务', signal);
+    failures = 0;
+    const done = settle(current);
+    if (done !== undefined) return resolveImageItem(site, done, signal);
+    if (Date.now() > deadline)
+      throw new HttpError(504, `等待生图任务 ${rawId} 超过 15 分钟，任务可能仍在后台生成，未重新提交`);
+  }
+}
+
 async function generateOpenAI(
   site: Site,
   input: GenerationInput,
@@ -319,10 +431,12 @@ async function generateOpenAI(
     input.aspectRatio && !exact
       ? `[Aspect ratio ${input.aspectRatio}, ${orientation(input.aspectRatio)} composition]\n\n${input.prompt}`
       : input.prompt;
-  // GPT image models support SSE streaming on both /images/generations and /images/edits, which
-  // lets gateways send periodic keepalives instead of hitting Cloudflare's 125s 524 timeout.
+  const root = openaiRoot(site.baseUrl);
+  // GPT image models support SSE streaming on both /images/generations and /images/edits, while
+  // sub2api also offers /images/{generations,edits}/async task polling that avoids holding any
+  // CDN connection open during multi-minute upstream header waits (e.g. Codex /images/edits).
   const streamable = /^gpt-image-/i.test(input.model) && !input.animation;
-  const send = (stream: boolean) => {
+  const send = (stream: boolean, asyncSuffix = false) => {
     const headers = authHeaders(site, 'openai');
     if (stream) headers.set('Accept', 'text/event-stream, application/json');
     let path: string, body: string | FormData;
@@ -360,8 +474,39 @@ async function generateOpenAI(
           : {}),
       });
     }
-    return request(openaiRoot(site.baseUrl) + path, { method: 'POST', headers, body }, signal);
+    return request(`${root}${path}${asyncSuffix ? '/async' : ''}`, { method: 'POST', headers, body }, signal);
   };
+
+  if ((asyncUnavailableUntil.get(root) || 0) <= Date.now()) {
+    const submitted = await send(false, true);
+    if (submitted.ok) {
+      if (!isEventStream(submitted)) {
+        const value = await json(submitted, '读取生图接口响应', signal);
+        if (Array.isArray(value?.data)) return resolveImageItem(site, value.data[0], signal);
+        return pollOpenAIImageTask(site, root, value, submitted.headers.get('retry-after'), signal);
+      }
+      // If a custom proxy returned SSE on /async, read it via the standard stream path below.
+      let first: { b64_json?: unknown; url?: unknown } | undefined;
+      for await (const { event, data } of sseEvents(submitted, MAX_GENERATION_RESPONSE_BYTES, '读取生图接口响应', signal)) {
+        const trimmed = data.trim();
+        if (!trimmed || trimmed === '[DONE]') continue;
+        const payload = JSON.parse(trimmed);
+        if (event === 'error' || payload?.type === 'error' || payload?.error) throw streamError(payload);
+        if (Array.isArray(payload?.data) && payload.data[0]) first = payload.data[0];
+        else if ((typeof payload?.b64_json === 'string' || typeof payload?.url === 'string') && !String(payload?.type || '').includes('partial'))
+          first = payload;
+      }
+      return resolveImageItem(site, first, signal);
+    }
+    const asyncErr = await upstreamError(submitted);
+    const notEnabled =
+      ((submitted.status === 404 || submitted.status === 405 || submitted.status === 501) &&
+        !/not supported for this platform/i.test(asyncErr.message)) ||
+      (submitted.status === 503 && /image task storage is unavailable|IMAGE_TASK_UNAVAILABLE/i.test(asyncErr.message));
+    if (!notEnabled) throw asyncErr;
+    asyncUnavailableUntil.set(root, Date.now() + ASYNC_NEGATIVE_TTL_MS);
+  }
+
   let response = await send(streamable);
   if (!response.ok) {
     const error = await upstreamError(response);
@@ -411,12 +556,7 @@ async function generateOpenAI(
   } else {
     first = (await json(response, '读取生图接口响应', signal))?.data?.[0];
   }
-  if (typeof first?.b64_json === 'string' && first.b64_json) return decode(first.b64_json);
-  if (typeof first?.url === 'string') {
-    const data = /^data:image\/(?:png|jpeg|webp|gif);base64,(.+)$/s.exec(first.url);
-    return data ? decode(data[1]) : download(site, first.url, signal);
-  }
-  throw new HttpError(502, '站点没有返回图片（响应中既没有 b64_json 也没有 url）');
+  return resolveImageItem(site, first, signal);
 }
 
 async function generateGemini(

@@ -140,6 +140,10 @@ export class Store {
   previewPath(board: Board, image: CanvasImage) {
     return join(this.dir(board.id), 'cache', `${image.id}-preview.jpg`);
   }
+  // A cached upload-slimmed copy of a heavy 2K/4K reference image (canvas original stays lossless).
+  uploadCachePath(board: Board, image: CanvasImage, ext: 'jpg' | 'png') {
+    return join(this.dir(board.id), 'cache', `${image.id}-upload.${ext}`);
+  }
   // Agents refer to items by id alone; look on the current board first, then on the rest.
   find(id: string): { board: Board; image: CanvasImage } | undefined {
     const current = this.current();
@@ -238,6 +242,8 @@ export class Store {
     rmSync(this.imagePath(board, image), { force: true });
     rmSync(this.sheetPath(board, image), { force: true });
     rmSync(this.previewPath(board, image), { force: true });
+    rmSync(this.uploadCachePath(board, image, 'jpg'), { force: true });
+    rmSync(this.uploadCachePath(board, image, 'png'), { force: true });
     this.save(board);
   }
   // Layout edits from the page: every field is validated, unknown ids are ignored.

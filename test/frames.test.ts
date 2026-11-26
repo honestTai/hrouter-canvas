@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { downscaleImage, ffmpegFrames, ffmpegPath, parseFrameAt } from '../src/frames.ts';
-import { inspectImage, inspectVideo } from '../src/image.ts';
+import { imageHasAlpha, inspectImage, inspectVideo } from '../src/image.ts';
 import { readFileSync } from 'node:fs';
 
 test('frame positions are parsed strictly', () => {
@@ -42,6 +42,22 @@ test('ffmpeg reads a keyframe sheet and single frames', { skip: !ffmpegPath() &&
     const preview = await downscaleImage(largePng, join(dir, 'preview.jpg'));
     assert.ok(preview && preview.byteLength < 400 * 1024);
     assert.deepEqual(inspectImage(preview), { mime: 'image/jpeg', width: 1280, height: 720 });
+    assert.equal(imageHasAlpha(new Uint8Array(readFileSync(largePng)), 'image/png'), false);
+
+    // Reference upload slimming: 2048px JPEG for opaque images, PNG preserved when RGBA has alpha.
+    const slimJpg = await downscaleImage(largePng, join(dir, 'ref.jpg'), { maxEdge: 2048, format: 'jpeg', quality: 88 });
+    assert.ok(slimJpg && slimJpg.byteLength < 800 * 1024);
+    assert.deepEqual(inspectImage(slimJpg), { mime: 'image/jpeg', width: 2048, height: 1152 });
+
+    const alphaPng = join(dir, 'alpha.png');
+    assert.equal(
+      spawnSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'color=c=red@0.5:s=2400x1200:d=1,format=rgba', '-frames:v', '1', alphaPng]).status,
+      0,
+    );
+    assert.equal(imageHasAlpha(new Uint8Array(readFileSync(alphaPng)), 'image/png'), true);
+    const slimPng = await downscaleImage(alphaPng, join(dir, 'ref.png'), { maxEdge: 2048, format: 'png' });
+    assert.ok(slimPng);
+    assert.deepEqual(inspectImage(slimPng), { mime: 'image/png', width: 2048, height: 1024 });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

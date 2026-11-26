@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { HttpError, type Site } from '../src/config.ts';
-import { generateImage } from '../src/providers.ts';
+import { generateImage, resetAsyncImageCache } from '../src/providers.ts';
 
 const site: Site = {
   id: 'test', name: 'Test', baseUrl: 'https://example.invalid',
@@ -77,11 +77,76 @@ const WEBP_2X2 = Buffer.from(
   'base64',
 );
 
-test('OpenAI gpt-image streams SSE with keepalives, skips partial frames, and falls back only on unsupported stream param', async (t) => {
+test('OpenAI async tasks poll /images/tasks/:id without holding long CDN connections, and never resubmit on failure', async (t) => {
+  process.env.HROUTER_CANVAS_IMAGE_POLL_MS = '10';
+  resetAsyncImageCache();
+  const seen: Array<{ url: string; method: string; auth: string }> = [];
+  let polls = 0;
+  t.mock.method(globalThis, 'fetch', async (url: unknown, init: any = {}) => {
+    const target = String(url);
+    const headers = new Headers(init.headers);
+    seen.push({ url: target, method: init.method || 'GET', auth: headers.get('authorization') || '' });
+    if (target === 'https://example.invalid/v1/images/edits/async') {
+      assert.ok(init.body instanceof FormData);
+      assert.equal(init.body.get('stream'), null);
+      return Response.json(
+        { id: 'imgtask_abc123', task_id: 'imgtask_abc123', status: 'processing', poll_url: '/v1/images/tasks/imgtask_abc123' },
+        { status: 202, headers: { 'Retry-After': '3' } },
+      );
+    }
+    if (target === 'https://example.invalid/v1/images/tasks/imgtask_abc123') {
+      polls++;
+      if (polls === 1) return Response.json({ task_id: 'imgtask_abc123', status: 'processing' });
+      if (polls === 2) return Response.json({ error: { message: 'gateway busy' } }, { status: 502 });
+      return Response.json({
+        task_id: 'imgtask_abc123',
+        status: 'completed',
+        http_status: 200,
+        image_url: 'https://r2.example.invalid/images/out.webp',
+        result: { data: [{ url: 'https://r2.example.invalid/images/out.webp' }] },
+      });
+    }
+    if (target === 'https://r2.example.invalid/images/out.webp')
+      return new Response(WEBP_2X2, { status: 200, headers: { 'Content-Type': 'image/webp' } });
+    return Response.json({ error: { message: 'unexpected' } }, { status: 404 });
+  });
+  const edited = await generateImage(
+    site,
+    { model: 'gpt-image-2', prompt: 'add sunset', references: [{ bytes: PNG_1X1, mime: 'image/png' }] },
+    new AbortController().signal,
+  );
+  assert.deepEqual([edited.mime, edited.width, edited.height], ['image/webp', 2, 2]);
+  assert.equal(seen.filter((s) => s.url.endsWith('/edits/async')).length, 1);
+  // Presigned object-storage download must NOT receive the site's Bearer API key.
+  assert.equal(seen.find((s) => s.url.startsWith('https://r2.example.invalid'))!.auth, '');
+
+  // A failed async task reports the upstream reason and never resubmits.
+  seen.length = 0;
+  t.mock.method(globalThis, 'fetch', async (url: unknown, init: any = {}) => {
+    const target = String(url);
+    seen.push({ url: target, method: init.method || 'GET', auth: '' });
+    if (target.endsWith('/generations/async'))
+      return Response.json({ task_id: 'imgtask_fail', status: 'processing' }, { status: 202 });
+    return Response.json({
+      task_id: 'imgtask_fail',
+      status: 'failed',
+      http_status: 400,
+      error: { type: 'invalid_request_error', message: 'content policy blocked' },
+    });
+  });
+  await assert.rejects(generateImage(site, input, new AbortController().signal), /content policy blocked/);
+  assert.equal(seen.filter((s) => s.url.endsWith('/generations/async')).length, 1);
+});
+
+test('OpenAI gpt-image falls back from 404 /async to SSE streaming with keepalives, and handles relays without stream param', async (t) => {
+  resetAsyncImageCache();
   const calls: Array<{ url: string; body: any }> = [];
   t.mock.method(globalThis, 'fetch', async (url: unknown, init: any) => {
+    const target = String(url);
     const body = typeof init.body === 'string' ? JSON.parse(init.body) : init.body;
-    calls.push({ url: String(url), body });
+    calls.push({ url: target, body });
+    if (target.endsWith('/async'))
+      return Response.json({ error: { message: 'async image tasks are not enabled' } }, { status: 404 });
     const chunks = [
       ': heartbeat\r\n\r\n',
       `event: image_generation.partial_image\ndata: ${JSON.stringify({ type: 'image_generation.partial_image', b64_json: PNG_1X1.toString('base64') })}\n\n`,
@@ -100,11 +165,14 @@ test('OpenAI gpt-image streams SSE with keepalives, skips partial frames, and fa
     );
   });
   const made = await generateImage(site, input, new AbortController().signal);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].body.stream, true);
+  assert.deepEqual(calls.map((c) => [c.url.endsWith('/async'), Boolean(c.body.stream)]), [
+    [true, false],
+    [false, true],
+  ]);
   assert.deepEqual([made.mime, made.width, made.height], ['image/webp', 2, 2]);
 
-  // A relay that rejects `stream` as an unknown parameter falls back to non-streaming once.
+  // Subsequent calls within the negative-cache window go straight to streaming, and a relay that
+  // rejects `stream` as an unknown parameter falls back to non-streaming once.
   calls.length = 0;
   t.mock.method(globalThis, 'fetch', async (url: unknown, init: any) => {
     const parsed = JSON.parse(init.body);

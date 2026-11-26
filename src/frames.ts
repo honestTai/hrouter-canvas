@@ -67,16 +67,34 @@ export function ffmpegFrames(
   });
 }
 
-// Shrinks large 2K/4K images into a compact JPEG preview so MCP tool responses do not stuff
-// multi-MB lossless PNGs into the agent's conversation context (which slows or breaks compaction).
-export function downscaleImage(file: string, outFile: string, maxEdge = 1280): Promise<Uint8Array | null> {
+export interface DownscaleOptions {
+  maxEdge?: number;
+  format?: 'jpeg' | 'png';
+  quality?: number;
+}
+
+// Shrinks large 2K/4K images into a compact JPEG/PNG so MCP previews do not bloat conversation
+// context and reference uploads do not spend 10+ seconds in gateway body/moderation transfers.
+export function downscaleImage(
+  file: string,
+  outFile: string,
+  options: DownscaleOptions | number = {},
+): Promise<Uint8Array | null> {
+  const opts = typeof options === 'number' ? { maxEdge: options } : options;
+  const maxEdge = opts.maxEdge ?? 1280;
+  const format = opts.format ?? 'jpeg';
+  const quality = opts.quality ?? 80;
   const bin = ffmpegPath();
   if (bin) {
     const scale = `scale='min(${maxEdge},iw)':'min(${maxEdge},ih)':force_original_aspect_ratio=decrease`;
+    const codec =
+      format === 'png'
+        ? ['-c:v', 'png', '-']
+        : ['-c:v', 'mjpeg', '-q:v', quality >= 85 ? '2' : '4', '-'];
     return new Promise((resolve) => {
       const child = spawn(
         bin,
-        ['-v', 'error', '-nostdin', '-i', file, '-frames:v', '1', '-vf', scale, '-f', 'image2pipe', '-c:v', 'mjpeg', '-q:v', '4', '-'],
+        ['-v', 'error', '-nostdin', '-i', file, '-frames:v', '1', '-vf', scale, '-f', 'image2pipe', ...codec],
         { stdio: ['ignore', 'pipe', 'ignore'] },
       );
       const chunks: Buffer[] = [];
@@ -84,7 +102,7 @@ export function downscaleImage(file: string, outFile: string, maxEdge = 1280): P
       const timer = setTimeout(() => child.kill('SIGKILL'), 15_000);
       child.stdout.on('data', (chunk: Buffer) => {
         size += chunk.length;
-        if (size > 8 * 1024 * 1024) child.kill('SIGKILL');
+        if (size > 16 * 1024 * 1024) child.kill('SIGKILL');
         else chunks.push(chunk);
       });
       child.once('error', () => {
@@ -100,12 +118,13 @@ export function downscaleImage(file: string, outFile: string, maxEdge = 1280): P
   if (process.platform === 'darwin' && process.env.HROUTER_CANVAS_FFMPEG !== 'off' && existsSync('/usr/bin/sips')) {
     return new Promise((resolve) => {
       mkdirSync(dirname(outFile), { recursive: true, mode: 0o700 });
-      const temp = `${outFile}.${process.pid}.${Date.now()}.tmp.jpg`;
-      const child = spawn(
-        '/usr/bin/sips',
-        ['-Z', String(maxEdge), '-s', 'format', 'jpeg', '-s', 'formatOptions', '80', file, '--out', temp],
-        { stdio: 'ignore' },
-      );
+      const ext = format === 'png' ? 'png' : 'jpg';
+      const temp = `${outFile}.${process.pid}.${Date.now()}.tmp.${ext}`;
+      const args =
+        format === 'png'
+          ? ['-Z', String(maxEdge), '-s', 'format', 'png', file, '--out', temp]
+          : ['-Z', String(maxEdge), '-s', 'format', 'jpeg', '-s', 'formatOptions', String(quality), file, '--out', temp];
+      const child = spawn('/usr/bin/sips', args, { stdio: 'ignore' });
       const timer = setTimeout(() => child.kill('SIGKILL'), 15_000);
       const done = (ok: boolean) => {
         clearTimeout(timer);

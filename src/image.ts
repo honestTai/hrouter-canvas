@@ -74,6 +74,32 @@ export function inspectImage(bytes: Uint8Array): ImageInfo {
 export const imageExtension = (mime: string) =>
   mime === 'video/mp4' ? 'mp4' : mime === 'image/jpeg' ? 'jpg' : mime === 'image/webp' ? 'webp' : mime === 'image/gif' ? 'gif' : 'png';
 
+// Detects whether an image header declares an alpha channel or transparency chunk so opaque
+// 2K/4K PNGs and WebPs can be safely re-encoded to compact JPEG before uploading as references.
+export function imageHasAlpha(bytes: Uint8Array, mime: string): boolean {
+  if (mime === 'image/jpeg') return false;
+  if (mime === 'image/png' && bytes.length >= 26) {
+    const colorType = bytes[25];
+    if (colorType === 4 || colorType === 6) return true;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let i = 8; i + 8 <= bytes.length; ) {
+      const len = view.getUint32(i);
+      const type = String.fromCharCode(bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]);
+      if (type === 'tRNS') return true;
+      if (type === 'IDAT' || type === 'IEND' || i + 12 + len > bytes.length) break;
+      i += 12 + len;
+    }
+    return false;
+  }
+  if (mime === 'image/webp' && bytes.length >= 21) {
+    const chunk = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
+    if (chunk === 'VP8X') return (bytes[20] & 0x10) !== 0;
+    if (chunk === 'VP8L') return (bytes[24] & 0x10) !== 0;
+    return false;
+  }
+  return true;
+}
+
 export interface VideoInfo {
   mime: 'video/mp4';
   width: number;
