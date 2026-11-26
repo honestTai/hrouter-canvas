@@ -115,12 +115,29 @@ export async function runMcp(): Promise<void> {
         site: z.string().optional().describe('Site id or name from list_image_models. Omit to use the user\'s default.'),
       },
     },
-    async (input) => {
+    async (input, extra) => {
       let port: number | undefined;
+      let heartbeat: ReturnType<typeof setInterval> | undefined;
       try {
         port = await ensureDaemon();
         // Open first so the user watches the placeholder turn into the picture.
         const opening = openCanvas(port);
+        const token = extra._meta?.progressToken;
+        if (token !== undefined) {
+          const startedAt = Date.now();
+          const every = Math.min(2000, Number(process.env.HROUTER_CANVAS_IMAGE_POLL_MS) || 2000);
+          let tick = 0;
+          heartbeat = setInterval(() => {
+            const elapsed = Math.round((Date.now() - startedAt) / 1000);
+            void extra
+              .sendNotification({
+                method: 'notifications/progress',
+                params: { progressToken: token, progress: ++tick, message: `生成图片中，已用 ${elapsed} 秒` },
+              })
+              .catch(() => {});
+          }, every);
+          heartbeat.unref?.();
+        }
         const result = await request(port, 'generate', {
           body: {
             prompt: input.prompt,
@@ -147,11 +164,13 @@ export async function runMcp(): Promise<void> {
             ...lines,
             ...result.errors.map((e: string) => `- one variation failed: ${e}`),
             where(await opening, canvasUrl(port)),
-            'Tell the user where the file is. Do not paste the image bytes or re-generate unless asked.',
+            'Tell the user where the file is. Do not read or paste the raw image bytes (use view_canvas_item if you need to inspect it) or re-generate unless asked.',
           ].join('\n'),
         );
       } catch (error) {
         return failure(error, port);
+      } finally {
+        if (heartbeat) clearInterval(heartbeat);
       }
     },
   );
@@ -401,10 +420,16 @@ export async function runMcp(): Promise<void> {
           width: number;
           height: number;
           label: string;
-          picture: Picture;
+          picture?: Picture;
+          note?: string;
         }>(port, `items/${input.video_id}/frame`, { body: { at: input.at ?? 'last' } });
         return withPicture(
-          `Saved the ${frame.label} of video ${input.video_id} as image ${frame.id} (${frame.width}×${frame.height}):\n- ${frame.path}\nUse ${frame.id} in generate_image reference_images to edit it, or as generate_video image to animate it.`,
+          [
+            `Saved the ${frame.label} of video ${input.video_id} as image ${frame.id} (${frame.width}×${frame.height}):`,
+            `- ${frame.path}`,
+            ...(frame.note ? [frame.note] : []),
+            `Use ${frame.id} in generate_image reference_images to edit it, or as generate_video image to animate it.`,
+          ].join('\n'),
           frame.picture,
         );
       } catch (error) {

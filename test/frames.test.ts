@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { ffmpegFrames, ffmpegPath, parseFrameAt } from '../src/frames.ts';
+import { downscaleImage, ffmpegFrames, ffmpegPath, parseFrameAt } from '../src/frames.ts';
 import { inspectImage, inspectVideo } from '../src/image.ts';
 import { readFileSync } from 'node:fs';
 
@@ -34,6 +34,14 @@ test('ffmpeg reads a keyframe sheet and single frames', { skip: !ffmpegPath() &&
         width: 320,
         height: 180,
       });
+    const largePng = join(dir, '4k.png');
+    assert.equal(
+      spawnSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=3840x2160:rate=1:duration=1', '-frames:v', '1', largePng]).status,
+      0,
+    );
+    const preview = await downscaleImage(largePng, join(dir, 'preview.jpg'));
+    assert.ok(preview && preview.byteLength < 400 * 1024);
+    assert.deepEqual(inspectImage(preview), { mime: 'image/jpeg', width: 1280, height: 720 });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

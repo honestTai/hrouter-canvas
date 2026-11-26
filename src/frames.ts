@@ -1,4 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import { dirname } from 'node:path';
 
 // What to pull out of a video: one full-size frame, or a 2×2 sheet of four evenly spaced frames
 // that lets an agent see a video it cannot play.
@@ -63,4 +65,64 @@ export function ffmpegFrames(
       else reject(new Error(`ffmpeg exited with ${code}`));
     });
   });
+}
+
+// Shrinks large 2K/4K images into a compact JPEG preview so MCP tool responses do not stuff
+// multi-MB lossless PNGs into the agent's conversation context (which slows or breaks compaction).
+export function downscaleImage(file: string, outFile: string, maxEdge = 1280): Promise<Uint8Array | null> {
+  const bin = ffmpegPath();
+  if (bin) {
+    const scale = `scale='min(${maxEdge},iw)':'min(${maxEdge},ih)':force_original_aspect_ratio=decrease`;
+    return new Promise((resolve) => {
+      const child = spawn(
+        bin,
+        ['-v', 'error', '-nostdin', '-i', file, '-frames:v', '1', '-vf', scale, '-f', 'image2pipe', '-c:v', 'mjpeg', '-q:v', '4', '-'],
+        { stdio: ['ignore', 'pipe', 'ignore'] },
+      );
+      const chunks: Buffer[] = [];
+      let size = 0;
+      const timer = setTimeout(() => child.kill('SIGKILL'), 15_000);
+      child.stdout.on('data', (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > 8 * 1024 * 1024) child.kill('SIGKILL');
+        else chunks.push(chunk);
+      });
+      child.once('error', () => {
+        clearTimeout(timer);
+        resolve(null);
+      });
+      child.once('close', (code) => {
+        clearTimeout(timer);
+        resolve(code === 0 && size ? new Uint8Array(Buffer.concat(chunks)) : null);
+      });
+    });
+  }
+  if (process.platform === 'darwin' && process.env.HROUTER_CANVAS_FFMPEG !== 'off' && existsSync('/usr/bin/sips')) {
+    return new Promise((resolve) => {
+      mkdirSync(dirname(outFile), { recursive: true, mode: 0o700 });
+      const temp = `${outFile}.${process.pid}.${Date.now()}.tmp.jpg`;
+      const child = spawn(
+        '/usr/bin/sips',
+        ['-Z', String(maxEdge), '-s', 'format', 'jpeg', '-s', 'formatOptions', '80', file, '--out', temp],
+        { stdio: 'ignore' },
+      );
+      const timer = setTimeout(() => child.kill('SIGKILL'), 15_000);
+      const done = (ok: boolean) => {
+        clearTimeout(timer);
+        try {
+          if (ok && existsSync(temp)) {
+            renameSync(temp, outFile);
+            return resolve(new Uint8Array(readFileSync(outFile)));
+          }
+        } catch {
+          // Fall through to cleanup.
+        }
+        rmSync(temp, { force: true });
+        resolve(null);
+      };
+      child.once('error', () => done(false));
+      child.once('close', (code) => done(code === 0));
+    });
+  }
+  return Promise.resolve(null);
 }

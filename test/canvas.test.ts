@@ -132,6 +132,18 @@ const upstream = createServer(async (request, response) => {
   }
   if (path === '/v1/images/edits')
     return json(200, { data: [{ url: `http://127.0.0.1:${upstreamPort}/files/result.png` }] });
+  if (path === '/v1beta/models/gemini-3.1-flash-image:streamGenerateContent?alt=sse') {
+    response.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+    response.write(':\n\n');
+    response.end(
+      `data: ${JSON.stringify({
+        candidates: [
+          { content: { parts: [{ text: 'here' }, { inlineData: { mimeType: 'image/png', data: PNG.toString('base64') } }] } },
+        ],
+      })}\n\n`,
+    );
+    return;
+  }
   if (path === '/v1beta/models/gemini-3.1-flash-image:generateContent')
     return json(200, {
       candidates: [
@@ -311,7 +323,7 @@ test('generate, reference, save and show on the board', async () => {
   const gemini = await call('generate', { json: { prompt: 'a fox', model: 'gemini-3.1-flash-image', resolution: '2K' } });
   assert.equal(gemini.status, 200, JSON.stringify(gemini.value));
   assert.equal(gemini.value.protocol, 'gemini');
-  const native = JSON.parse(seen.findLast((r) => r.path.includes(':generateContent'))!.body);
+  const native = JSON.parse(seen.findLast((r) => r.path.includes(':streamGenerateContent'))!.body);
   assert.deepEqual(native.generationConfig.imageConfig, { imageSize: '2K' });
 
   const board = (await call(`boards/${first.value.board.id}`)).value;
@@ -539,7 +551,7 @@ test('agents can list the canvas, look at a video and build on its frames', asyn
 test('the MCP server exposes the tools and generates through the shared service', async () => {
   const mcpHome = mkdtempSync(join(tmpdir(), 'hrouter-canvas-mcp-'));
   const port = 20000 + Math.floor(Math.random() * 20000);
-  const env = {
+    const env = {
     ...process.env,
     HROUTER_CANVAS_HOME: mcpHome,
     HROUTER_CANVAS_PORT: String(port),
@@ -548,6 +560,7 @@ test('the MCP server exposes the tools and generates through the shared service'
     HROUTER_CANVAS_API_KEY: KEY,
     HROUTER_CANVAS_MODEL: 'gpt-image-2',
     HROUTER_CANVAS_VIDEO_MODEL: 'grok-imagine-video-1.5',
+    HROUTER_CANVAS_IMAGE_POLL_MS: '10',
   };
   const cli = join(root, 'dist', 'cli.mjs');
   const child = spawn(process.execPath, [cli, 'mcp'], { env, stdio: ['pipe', 'pipe', 'inherit'] });
@@ -589,12 +602,17 @@ test('the MCP server exposes the tools and generates through the shared service'
     // No tool may accept a site address or API key from the model.
     assert.ok(!/api_?key|base_?url/i.test(JSON.stringify(tools.map((t: any) => t.inputSchema))));
 
-    const made = await rpc('tools/call', { name: 'generate_image', arguments: { prompt: 'a red bicycle', aspect_ratio: '1:1' } });
+    const made = await rpc('tools/call', {
+      name: 'generate_image',
+      arguments: { prompt: 'a red bicycle', aspect_ratio: '1:1' },
+      _meta: { progressToken: 'img-1' },
+    });
     assert.ok(!made.result.isError, made.result.content[0].text);
     const path = /^- (\/.+\.png) \(1×1/m.exec(made.result.content[0].text)?.[1];
     assert.ok(path && path.startsWith(mcpHome), made.result.content[0].text);
     assert.deepEqual(readFileSync(path), PNG);
     assert.match(made.result.content[0].text, /No browser here/);
+    assert.match(made.result.content[0].text, /Do not read or paste the raw image bytes/);
     assert.ok(!made.result.content[0].text.includes(KEY));
 
     // Agent-driven image-to-video: the generated still's path becomes the first frame.

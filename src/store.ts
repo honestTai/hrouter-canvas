@@ -136,6 +136,10 @@ export class Store {
   sheetPath(board: Board, image: CanvasImage) {
     return join(this.dir(board.id), 'cache', `${image.id}-sheet.jpg`);
   }
+  // A cached compact JPEG preview for large still images / extracted frames.
+  previewPath(board: Board, image: CanvasImage) {
+    return join(this.dir(board.id), 'cache', `${image.id}-preview.jpg`);
+  }
   // Agents refer to items by id alone; look on the current board first, then on the rest.
   find(id: string): { board: Board; image: CanvasImage } | undefined {
     const current = this.current();
@@ -233,6 +237,7 @@ export class Store {
     board.edges = board.edges.filter((e) => e.source !== id && e.target !== id);
     rmSync(this.imagePath(board, image), { force: true });
     rmSync(this.sheetPath(board, image), { force: true });
+    rmSync(this.previewPath(board, image), { force: true });
     this.save(board);
   }
   // Layout edits from the page: every field is validated, unknown ids are ignored.
